@@ -31,7 +31,16 @@ from .models import Model, Post, TweetRef
 from .normalize import merge, parse_sources
 from .sources import fetch_sources
 
-__all__ = ["PullReport", "hydrate", "pull", "pull_handles", "pull_ids", "expand_thread", "watch"]
+__all__ = [
+    "PullReport",
+    "hydrate",
+    "pull",
+    "pull_handles",
+    "pull_ids",
+    "expand_thread",
+    "watch",
+    "monitor",
+]
 
 
 def _now() -> str:
@@ -130,11 +139,23 @@ async def hydrate(
     return posts, errors
 
 
-def _store(dataset: Dataset, posts: Iterable[Post], report: PullReport) -> None:
+def _store(
+    dataset: Dataset,
+    posts: Iterable[Post],
+    report: PullReport,
+    new_out: list[Post] | None = None,
+) -> None:
+    """Upsert posts; `new_out` collects the ones seen for the first time.
+
+    Monitoring needs the actual new posts, not just a count, so sinks can be
+    handed the objects without re-querying.
+    """
     for post in posts:
         try:
             if dataset.upsert_post(post):
                 report.new_posts += 1
+                if new_out is not None:
+                    new_out.append(post)
             else:
                 report.updated_posts += 1
             if post.profile and post.profile.screen_name:
@@ -152,6 +173,7 @@ async def pull_ids(
     client: httpx.AsyncClient | None = None,
     refresh: bool = True,
     handles: dict[str, str] | None = None,
+    new_out: list[Post] | None = None,
 ) -> PullReport:
     """Hydrate specific ids. `refresh=False` skips ids already in the dataset."""
     started = time.perf_counter()
@@ -173,7 +195,7 @@ async def pull_ids(
                 await client.aclose()
         report.hydrated = len(posts)
         report.errors += errors
-        _store(dataset, posts, report)
+        _store(dataset, posts, report, new_out)
 
     report.elapsed_ms = int((time.perf_counter() - started) * 1000)
     return report
@@ -227,6 +249,8 @@ async def pull_handles(
     refresh: bool = False,
     deep: bool = False,
     with_profile: bool = True,
+    new_out: list[Post] | None = None,
+    on_handle=None,
 ) -> PullReport:
     """Collect each account's posts: guest GraphQL timeline first, SSR as fallback.
 
@@ -271,6 +295,7 @@ async def pull_handles(
                 dataset,
                 client=client,
                 refresh=refresh,
+                new_out=new_out,
                 handles={i: handle for i in found},
             )
             sub.merge_in(hydrated)
@@ -294,7 +319,7 @@ async def pull_handles(
                         keep = [p for p in posts if p.id not in known]
                     sub.discovered += len(ids)
                     sub.hydrated += len(keep)
-                    _store(dataset, keep, sub)
+                    _store(dataset, keep, sub, new_out)
 
             if with_profile:
                 profile, err = await user_profile(client, handle, settings)
@@ -314,6 +339,11 @@ async def pull_handles(
             polls=(cursor.get("polls") or 0) + 1,
             last_error=discovery_error or (sub.errors[0] if sub.errors else None),
         )
+        if on_handle is not None:
+            try:
+                on_handle(handle, sub)
+            except Exception as exc:  # a bad callback must not kill the poll
+                sub.errors.append(f"@{handle}: on_handle failed: {exc!r}")
         return sub
 
     try:
@@ -516,5 +546,105 @@ async def watch(
             if rounds is not None and round_no >= rounds:
                 break
             await asyncio.sleep(interval)
+
+    return total
+
+
+async def monitor(
+    watchlist,
+    settings: Settings,
+    dataset: Dataset,
+    *,
+    notifier=None,
+    rounds: int | None = None,
+    tick: float = 5.0,
+    on_round=None,
+) -> PullReport:
+    """Poll a persisted watchlist on per-account cadence until stopped.
+
+    Unlike `watch()`, which polls a fixed list on one fixed interval, this
+    asks the watchlist which accounts are *due*. That matters because posting
+    rates differ by an order of magnitude: measured over two days, @Reuters
+    averaged a post every 364 s (so its 5-id page rolls over in ~30 min) while
+    @CNN averaged one every 3092 s. One global interval either wastes requests
+    on quiet accounts or loses posts on busy ones.
+
+    Each poll reports back to the watchlist, which halves an account's
+    interval whenever a round comes back entirely new (proof the page rolled
+    over and posts were missed) and relaxes it again after clean polls.
+    """
+    total = PullReport()
+    round_no = 0
+
+    async with client_for(settings) as client:
+        while rounds is None or round_no < rounds:
+            now = time.time()
+            due = watchlist.due(now, default_interval=settings.watch_interval)
+            if not due:
+                if rounds is not None:
+                    break
+                await asyncio.sleep(tick)
+                continue
+
+            round_no += 1
+            new_posts: list[Post] = []
+            outcomes: dict[str, PullReport] = {}
+
+            report = await pull_handles(
+                [w.handle for w in due],
+                settings,
+                dataset,
+                client=client,
+                refresh=False,
+                new_out=new_posts,
+                on_handle=lambda h, sub: outcomes.__setitem__(h, sub),
+            )
+
+            polled = time.time()
+            for entry in due:
+                sub = outcomes.get(entry.handle)
+                # An account's first poll is all-new by definition; only treat
+                # a full page of new ids as a rollover once there is a baseline
+                # to compare against, or every new watchlist entry would
+                # immediately halve its own interval.
+                rollover = bool(
+                    sub and entry.polls and sub.discovered and sub.new_posts == sub.discovered
+                )
+                watchlist.record_poll(
+                    entry.handle,
+                    new_posts=sub.new_posts if sub else 0,
+                    rollover=rollover,
+                    error=(sub.errors[0] if sub and sub.errors else None),
+                    now=polled,
+                    default_interval=settings.watch_interval,
+                )
+                if rollover:
+                    report.errors.append(
+                        f"@{entry.handle}: every discovered id was new - the page rolled over "
+                        f"between polls, posts were missed; interval halved"
+                    )
+
+            if notifier is not None and new_posts:
+                try:
+                    deliveries = await notifier.dispatch(
+                        new_posts,
+                        {
+                            "round": round_no,
+                            "handles": [w.handle for w in due],
+                            "polled_utc": _now(),
+                        },
+                    )
+                    report.errors += [
+                        f"sink {d.sink}: {d.error}" for d in deliveries if not d.ok and d.error
+                    ]
+                except Exception as exc:  # pragma: no cover - Notifier already guards
+                    report.errors.append(f"notify_failed: {exc!r}")
+
+            total.merge_in(report)
+            if on_round:
+                on_round(round_no, report, new_posts)
+            if rounds is not None and round_no >= rounds:
+                break
+            await asyncio.sleep(min(tick, settings.watch_interval))
 
     return total

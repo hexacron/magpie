@@ -44,5 +44,31 @@ services:
 #   web:
 #     external: true
 
+  # Continuous monitoring of the persisted watchlist. Shares the same volume
+  # as the web service, so posts it collects are immediately queryable and
+  # browsable there. Manage the watchlist with:
+  #   docker compose exec monitor magpie watchlist add @Reuters @AFP
+  #   docker compose exec monitor magpie watchlist tune
+  # Deliver new posts somewhere by setting MAGPIE_NOTIFY in .env, e.g.
+  #   MAGPIE_NOTIFY=webhook:https://hooks.example.com/x
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: magpie:2.0.0
+    container_name: magpie-monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MAGPIE_DATA_DIR: /data
+    volumes:
+      - magpie-data:/data
+    command: >
+      sh -c 'magpie monitor
+      --notify "file:/data/new-posts.jsonl"
+      ${MAGPIE_NOTIFY:+--notify "$MAGPIE_NOTIFY"}'
+    depends_on:
+      - magpie
+
 volumes:
   magpie-data:

@@ -69,6 +69,65 @@ index over post text. Re-polling a stored post updates its counters and `last_se
 while preserving `first_seen_utc`, so engagement over time is recoverable. `magpie query` is
 read-only (`SELECT`/`WITH` only, no stacked statements, `PRAGMA query_only=ON`).
 
+## Monitoring a fixed set of accounts
+
+```sh
+magpie watchlist add @Reuters @AFP @BBCWorld --tag news
+magpie watchlist add @elonmusk --interval 120 --tag tech
+magpie watchlist tune            # set each cadence from that account's own posting rate
+magpie watchlist                 # show state: interval, polls, new, rollovers, last error
+
+magpie monitor --notify 'webhook:https://hooks.example.com/x' --notify file:/var/log/x.jsonl
+```
+
+`monitor` differs from `watch` in the thing that actually matters: it polls each account on
+**its own cadence** rather than one global interval. That is not a preference. Measured over
+two days of collection, `@Reuters` averaged a post every 364 s — so the 5-id profile page
+rolls over in about 30 minutes — while `@CNN` averaged one every 3092 s. A single interval
+either burns requests on the quiet account or silently loses posts on the busy one.
+
+### Self-tuning cadence
+
+When a poll returns a page where *every* id is new, the page rolled over between polls and
+posts were missed. Magpie treats that as evidence and **halves that account's interval**
+(floor 60 s), relaxing it back by 25% after five clean polls. An account's first poll is
+exempt, since everything is new by definition.
+
+`magpie watchlist tune` seeds the cadence from measured history, with two deliberate biases:
+it ignores posts older than 14 days (a `--deep` backfill otherwise drags the median gap from
+minutes to months), and it never proposes an interval *slower* than the global default —
+a poll only ever reveals 5 ids, so observed gaps overstate the true rate, and the error is
+asymmetric: over-polling costs requests, under-polling loses posts.
+
+### Sinks
+
+New posts are delivered to any combination of `--notify` targets:
+
+| Spec | Behaviour |
+| --- | --- |
+| `webhook:https://…` | `POST {event, count, context, posts[]}`, chunked at 100 posts, 2 retries on 5xx/timeout, never on 4xx. `MAGPIE_WEBHOOK_TOKEN` adds a bearer header. |
+| `file:/path.jsonl` | Appends one JSON object per line; reopened per dispatch so log rotation works. |
+| `cmd:'notify-send {count} new'` | Runs argv (never a shell) with the posts as JSON on stdin. |
+| `stdout` | Human-readable lines. |
+
+A sink that fails cannot stop collection: each runs concurrently and any exception becomes a
+logged delivery error.
+
+### As a service
+
+`docker compose up -d` starts the `monitor` service alongside the web UI, sharing one volume
+so collected posts are immediately queryable and browsable:
+
+```sh
+docker compose exec monitor magpie watchlist add @Reuters @AFP
+docker compose logs -f monitor
+```
+
+Seed a fresh deployment without an exec step by setting `MAGPIE_WATCH="@Reuters @AFP"` in
+`.env`. With an empty watchlist the daemon waits for accounts rather than exiting — exiting
+would crash-loop under `restart: unless-stopped`, and a crash-looping container cannot be
+`exec`d into to fix itself.
+
 ## Evidence mode (optional)
 
 `magpie capture` and the web UI produce the sealed package described below — raw source

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -338,6 +339,137 @@ def cmd_data_stats(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _watchlist(settings: Settings):
+    from .watchlist import Watchlist
+
+    return Watchlist(settings)
+
+
+def cmd_watchlist(args: argparse.Namespace, settings: Settings) -> int:
+    wl = _watchlist(settings)
+    ds = _dataset(settings)
+    action = args.action
+
+    if action == "add":
+        if not args.handles:
+            print("give at least one @handle", file=sys.stderr)
+            return 2
+        for h in args.handles:
+            entry = wl.add(h, interval=args.interval, tags=args.tag, note=args.note)
+            every = f" every {entry.interval:.0f}s" if entry.interval else ""
+            tags = f" [{', '.join(entry.tags)}]" if entry.tags else ""
+            print(f"watching @{entry.display}{every}{tags}")
+    elif action == "rm":
+        for h in args.handles:
+            print(f"removed @{h}" if wl.remove(h) else f"not watched: @{h}")
+    elif action in ("enable", "disable"):
+        for h in args.handles:
+            ok = wl.enable(h, action == "enable")
+            print(f"@{h} {action}d" if ok else f"not watched: @{h}")
+    elif action == "tune":
+        # Set each account's cadence from its own measured posting rate.
+        #
+        # Ceiling is the global default, never higher. The measurement is made
+        # from a sparse sample -- a poll only ever reveals 5 ids, so observed
+        # gaps overstate the true cadence (measured: @AFP estimated at 3600 s
+        # while actually posting every few minutes). The error is asymmetric:
+        # over-polling costs requests, under-polling loses posts. So tuning may
+        # only make an account faster than the default.
+        for entry in wl.list():
+            suggested = wl.suggest_interval(entry.handle, ds, ceiling=settings.watch_interval)
+            if suggested is None:
+                print(f"  @{entry.display:<18} not enough history to measure")
+                continue
+            # Never slow down an account that has already proven it needs to be
+            # polled faster: a rollover is measured evidence of lost posts,
+            # while the suggestion is an estimate from a sparse sample.
+            if entry.rollovers:
+                current = entry.interval or settings.watch_interval
+                chosen = min(suggested, current)
+                if chosen != suggested:
+                    print(f"  @{entry.display:<18} keeping {chosen:.0f}s "
+                          f"(suggested {suggested:.0f}s, but {entry.rollovers} rollover(s) seen)")
+                    wl.set_interval(entry.handle, chosen)
+                    continue
+                suggested = chosen
+            wl.set_interval(entry.handle, suggested)
+            print(f"  @{entry.display:<18} interval -> {suggested:.0f}s")
+    else:  # list
+        entries = wl.list(tag=args.tag[0] if args.tag else None)
+        print(_bold(f"{len(entries)} account(s) watched"))
+        for e in entries:
+            state = "on " if e.enabled else "off"
+            every = f"{e.interval:.0f}s" if e.interval else f"{settings.watch_interval:.0f}s*"
+            flag = f"  rollovers={e.rollovers}" if e.rollovers else ""
+            err = f"  !{e.last_error[:40]}" if e.last_error else ""
+            print(f"  {state} @{e.display:<18} every {every:>7}  polls={e.polls:<4} "
+                  f"new={e.new_posts:<5}{flag}{err}")
+        if entries:
+            print("  (* = global default; tune with `magpie watchlist tune`)")
+    wl.close()
+    ds.close()
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace, settings: Settings) -> int:
+    from .notify import Notifier, build_sinks
+    from .pull import monitor
+
+    wl = _watchlist(settings)
+    ds = _dataset(settings)
+
+    # `MAGPIE_WATCH="@a @b"` seeds a fresh deployment without an exec step.
+    for h in (args.add or []) + (os.environ.get("MAGPIE_WATCH", "").split()):
+        if h.strip():
+            wl.add(h)
+
+    entries = wl.list(enabled_only=True)
+    if not entries:
+        if args.rounds is not None:
+            print("watchlist is empty: `magpie watchlist add @handle`", file=sys.stderr)
+            wl.close()
+            ds.close()
+            return 2
+        # Daemon mode: wait for accounts instead of exiting. Exiting here makes
+        # `restart: unless-stopped` a crash loop, and a crash-looping container
+        # cannot be `exec`d into to add the accounts that would fix it.
+        print("watchlist is empty - waiting for accounts "
+              "(`magpie watchlist add @handle`, or set MAGPIE_WATCH)")
+
+    sinks, errors = build_sinks(args.notify or [], settings)
+    for err in errors:
+        print(f"  ! sink: {err}", file=sys.stderr)
+    notifier = Notifier(sinks) if sinks else None
+
+    tail = f" -> {len(sinks)} sink(s)" if sinks else ""
+    print(_bold(f"monitoring {len(entries)} account(s){tail}"))
+    for e in entries:
+        print(f"  @{e.display} every {(e.interval or settings.watch_interval):.0f}s")
+
+    def on_round(n, report, new_posts):
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+        if new_posts or report.errors or args.verbose:
+            print(f"[{stamp}] round {n}: {len(new_posts)} new "
+                  f"({report.discovered} seen, {report.already_known} known)")
+        for p in new_posts:
+            text = (p.text or "").replace("\n", " ")[:88]
+            print(f"    @{p.screen_name}: {text}")
+        for err in report.errors:
+            print(f"    ! {err}")
+
+    try:
+        asyncio.run(
+            monitor(wl, settings, ds, notifier=notifier, rounds=args.rounds,
+                    tick=args.tick, on_round=on_round)
+        )
+    except KeyboardInterrupt:
+        print("\nstopped")
+    wl.close()
+    ds.close()
+    return 0
+
+
+
 def _session_for(settings: Settings):
     """Authenticated session when accounts exist, guest otherwise.
 
@@ -482,11 +614,30 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--json", action="store_true")
     pl.set_defaults(func=cmd_pull)
 
-    wa = sub.add_parser("watch", help="poll a watchlist on an interval")
+    wa = sub.add_parser("watch", help="ad-hoc: poll handles given on the command line")
     wa.add_argument("handles", nargs="*")
     wa.add_argument("--interval", type=float, help="seconds between rounds (default MAGPIE_WATCH_INTERVAL)")
     wa.add_argument("--rounds", type=int, help="stop after N rounds (default: run forever)")
     wa.set_defaults(func=cmd_watch)
+
+    wl = sub.add_parser("watchlist", help="manage the persisted set of monitored accounts")
+    wl.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "rm", "enable", "disable", "tune"])
+    wl.add_argument("handles", nargs="*")
+    wl.add_argument("--interval", type=float, help="per-account seconds between polls")
+    wl.add_argument("--tag", action="append", help="group accounts (repeatable)")
+    wl.add_argument("--note")
+    wl.set_defaults(func=cmd_watchlist)
+
+    mo = sub.add_parser("monitor", help="run the watchlist continuously on per-account cadence")
+    mo.add_argument("--add", nargs="*", help="add these handles to the watchlist first")
+    mo.add_argument("--notify", action="append",
+                    help="sink: webhook:URL | file:/path.jsonl | cmd:'argv {count}' | stdout "
+                         "(repeatable)")
+    mo.add_argument("--rounds", type=int, help="stop after N polling rounds")
+    mo.add_argument("--tick", type=float, default=5.0, help="scheduler resolution in seconds")
+    mo.add_argument("--verbose", action="store_true", help="log quiet rounds too")
+    mo.set_defaults(func=cmd_monitor)
 
     th = sub.add_parser("thread", help="crawl outward from one post")
     th.add_argument("tweet_id")
