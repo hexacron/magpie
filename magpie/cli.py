@@ -339,6 +339,48 @@ def cmd_data_stats(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_health(args: argparse.Namespace, settings: Settings) -> int:
+    """Liveness for the monitor daemon: is every watched account being polled?
+
+    The image's HEALTHCHECK curls /healthz, which only the web service serves;
+    the monitor container can never pass it and reports `unhealthy` forever.
+    This checks the thing that actually indicates the daemon is working: each
+    enabled account polled within a grace multiple of its own interval.
+    """
+    wl = _watchlist(settings)
+    entries = wl.list(enabled_only=True)
+
+    if not entries:
+        # Waiting for accounts is a valid running state, not a failure.
+        print("ok: watchlist empty (waiting for accounts)")
+        wl.close()
+        return 0
+
+    now = datetime.now(timezone.utc).timestamp()
+    stale: list[str] = []
+    for entry in entries:
+        interval = entry.interval or settings.watch_interval
+        grace = max(args.grace * interval, args.min_grace)
+        age = None
+        if entry.last_poll_utc:
+            try:
+                age = now - datetime.strptime(
+                    entry.last_poll_utc, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                age = None
+        if age is None:
+            stale.append(f"@{entry.display}: never polled")
+        elif age > grace:
+            stale.append(f"@{entry.display}: last poll {age:.0f}s ago (interval {interval:.0f}s)")
+
+    wl.close()
+    if stale:
+        print("stale: " + "; ".join(stale), file=sys.stderr)
+        return 1
+    print(f"ok: {len(entries)} account(s) polled within grace")
+    return 0
+
 def _watchlist(settings: Settings):
     from .watchlist import Watchlist
 
@@ -636,8 +678,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "(repeatable)")
     mo.add_argument("--rounds", type=int, help="stop after N polling rounds")
     mo.add_argument("--tick", type=float, default=5.0, help="scheduler resolution in seconds")
+
     mo.add_argument("--verbose", action="store_true", help="log quiet rounds too")
     mo.set_defaults(func=cmd_monitor)
+
+    he = sub.add_parser("health", help="monitor liveness: are watched accounts being polled?")
+    he.add_argument("--grace", type=float, default=3.0,
+                    help="allowed multiple of each account's interval (default 3)")
+    he.add_argument("--min-grace", type=float, default=180.0,
+                    help="floor on the grace window in seconds")
+    he.set_defaults(func=cmd_health)
 
     th = sub.add_parser("thread", help="crawl outward from one post")
     th.add_argument("tweet_id")
