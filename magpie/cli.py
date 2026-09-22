@@ -1,4 +1,4 @@
-"""Command line entry point: `xw <verb>`.
+"""Command line entry point: `magpie <verb>`.
 
 Local use never needs the web server; `magpie capture` writes the same sealed
 packages the UI does.

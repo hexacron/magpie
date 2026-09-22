@@ -36,7 +36,7 @@ services:
     #     - web
     #
     # If the proxy terminates TLS and adds X-Forwarded-*, set
-    # MAGPIE_TRUST_PROXY=1 in .env, and MAGPIE_BASE_PATH=/xw when it is mounted
+    # MAGPIE_TRUST_PROXY=1 in .env, and MAGPIE_BASE_PATH=/magpie when it is mounted
     # under a subpath.
     # ------------------------------------------------------------------
 
