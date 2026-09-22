@@ -403,11 +403,13 @@ def cmd_watchlist(args: argparse.Namespace, settings: Settings) -> int:
             print(f"watching @{entry.display}{every}{tags}")
     elif action == "rm":
         for h in args.handles:
-            print(f"removed @{h}" if wl.remove(h) else f"not watched: @{h}")
+            name = h.lstrip("@")
+            print(f"removed @{name}" if wl.remove(h) else f"not watched: @{name}")
     elif action in ("enable", "disable"):
         for h in args.handles:
+            name = h.lstrip("@")
             ok = wl.enable(h, action == "enable")
-            print(f"@{h} {action}d" if ok else f"not watched: @{h}")
+            print(f"@{name} {action}d" if ok else f"not watched: @{name}")
     elif action == "tune":
         # Set each account's cadence from its own measured posting rate.
         #

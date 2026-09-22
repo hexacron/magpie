@@ -37,8 +37,10 @@ from starlette.background import BackgroundTask
 
 from .capture import capture_many, load_timestamp
 from .config import Settings, load_settings
+from .dataset import Dataset
 from .models import TOOL_VERSION
 from .store import Store
+from .watchlist import Watchlist
 
 log = logging.getLogger("magpie.web")
 
@@ -230,6 +232,10 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     settings = settings or load_settings()
     settings.ensure_dirs()
     store = store if store is not None else Store(settings)
+    # The monitored dataset is the primary workflow; the capture store is the
+    # optional evidence path. Both are served from one UI.
+    dataset = Dataset(settings)
+    watchlist = Watchlist(settings)
     base = settings.base_path
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -506,6 +512,78 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
                 status_code=200,
             )
         return RedirectResponse(settings.url_for("/captures"), 303)
+
+    def _safe(fn) -> dict[str, Any]:
+        """Stats are decoration; a failure must not blank the page."""
+        try:
+            return fn() or {}
+        except Exception:  # pragma: no cover - sqlite hiccup
+            return {}
+
+    @router.get("/posts", response_class=HTMLResponse)
+    async def posts_view(
+        request: Request,
+        q: str | None = None,
+        user: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        media: int | None = None,
+        page: int = Query(1, ge=1, le=100000),
+    ) -> Response:
+        """Browse the monitored dataset - the output of `magpie monitor`."""
+        filters = {"q": q, "user": user, "since": since, "until": until}
+        rows, total = dataset.posts(
+            q=q,
+            handle=user,
+            since=since,
+            until=until,
+            has_media=True if media else None,
+            limit=PER_PAGE,
+            offset=(page - 1) * PER_PAGE,
+        )
+        pages = max(1, ceil(total / PER_PAGE)) if total else 1
+
+        def page_url(n: int) -> str:
+            query = {k: v for k, v in filters.items() if v}
+            if media:
+                query["media"] = "1"
+            if n > 1:
+                query["page"] = str(n)
+            suffix = f"?{urlencode(query)}" if query else ""
+            return settings.url_for(f"/posts{suffix}")
+
+        return _page(
+            request,
+            "posts.html",
+            rows=rows,
+            total=total,
+            page=page,
+            pages=pages,
+            page_url=page_url,
+            filters={**filters, "media": media},
+            stats=_safe(dataset.stats),
+        )
+
+    @router.get("/accounts", response_class=HTMLResponse)
+    async def accounts_view(request: Request) -> Response:
+        """Watchlist state next to what each account has actually produced."""
+        entries = [e.to_dict() for e in watchlist.list()]
+        profiles = {u.get("screen_name"): u for u in dataset.users(limit=500)}
+        for entry in entries:
+            handle = (entry.get("handle") or "").lower()
+            entry["profile"] = profiles.get(handle) or {}
+            rows, count = dataset.posts(handle=handle, limit=1)
+            entry["stored_posts"] = count
+            entry["latest"] = rows[0] if rows else None
+            entry["effective_interval"] = entry.get("interval") or settings.watch_interval
+        entries.sort(key=lambda e: e.get("stored_posts") or 0, reverse=True)
+        return _page(
+            request,
+            "accounts.html",
+            entries=entries,
+            default_interval=settings.watch_interval,
+            stats=_safe(dataset.stats),
+        )
 
     @router.get("/captures", response_class=HTMLResponse)
     async def captures(

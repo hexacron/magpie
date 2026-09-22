@@ -46,11 +46,13 @@
 <header class="top">
   <a class="brand" href="{{ url('/') }}"><b>mag</b>pie<small>{{ tool_version }}</small></a>
   <nav class="nav">
-    <a href="{{ url('/') }}"{% if path == url('/') %} class="on"{% endif %}>New capture</a>
+    <a href="{{ url('/posts') }}"{% if '/posts' in path %} class="on"{% endif %}>Posts</a>
+    <a href="{{ url('/accounts') }}"{% if '/accounts' in path %} class="on"{% endif %}>Accounts</a>
     <a href="{{ url('/captures') }}"{% if '/captures' in path %} class="on"{% endif %}>Captures</a>
+    <a href="{{ url('/') }}"{% if path == url('/') %} class="on"{% endif %}>New capture</a>
   </nav>
-  <form class="search" action="{{ url('/captures') }}" method="get" role="search">
-    <input type="search" name="q" value="{{ (filters.q if filters else '') or '' }}" placeholder="search text, handle, OCR…" aria-label="Search captures">
+  <form class="search" action="{{ url('/posts') }}" method="get" role="search">
+    <input type="search" name="q" value="{{ (filters.q if filters else '') or '' }}" placeholder="search collected posts…" aria-label="Search posts">
     <button type="submit">Search</button>
   </form>
   <div class="who">

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Posts · {{ settings.site_name }}{% endblock %}
+
+{% block content %}
+<section class="section-head">
+  <h1>Posts</h1>
+  <span class="muted">{{ total|num }} collected{% if stats.authors %} from {{ stats.authors }} account(s){% endif %}</span>
+</section>
+
+<form class="filters" action="{{ url('/posts') }}" method="get">
+  <label class="field">
+    <span>Text</span>
+    <input type="search" name="q" value="{{ filters.q or '' }}" placeholder="words, OR, phrases">
+  </label>
+  <label class="field">
+    <span>Handle</span>
+    <input type="text" name="user" value="{{ filters.user or '' }}" placeholder="@handle">
+  </label>
+  <label class="field">
+    <span>Since</span>
+    <input type="text" name="since" value="{{ filters.since or '' }}" placeholder="yyyy-mm-dd">
+  </label>
+  <label class="field">
+    <span>Until</span>
+    <input type="text" name="until" value="{{ filters.until or '' }}" placeholder="yyyy-mm-dd">
+  </label>
+  <label class="check">
+    <input type="checkbox" name="media" value="1"{% if filters.media %} checked{% endif %}>
+    <span>Media only</span>
+  </label>
+  <div class="filter-actions">
+    <button class="primary" type="submit">Filter</button>
+    <a class="btn" href="{{ url('/posts') }}">Reset</a>
+  </div>
+</form>
+
+{% if rows %}
+<div class="posts">
+  {% for row in rows %}
+  <article class="post">
+    <div class="post-head">
+      <a class="handle" href="{{ url('/posts') }}?user={{ row.screen_name }}">@{{ row.screen_name }}</a>
+      {% if row.name %}<span class="muted small">{{ row.name }}</span>{% endif %}
+      <span class="spacer"></span>
+      <time class="muted small mono">{{ row.created_at_utc|dt }}</time>
+    </div>
+    <p class="post-text">{{ row.text }}</p>
+    <div class="post-meta">
+      <span title="likes">&#9829; {{ (row.likes or 0)|num }}</span>
+      <span title="reposts">&#8634; {{ (row.retweets or 0)|num }}</span>
+      <span title="replies">&#9998; {{ (row.replies or 0)|num }}</span>
+      {% if row.views %}<span title="views">&#128065; {{ row.views|num }}</span>{% endif %}
+      {% if row.media_count %}<span class="tag">{{ row.media_count }} media</span>{% endif %}
+      {% if row.reply_to_id %}<span class="tag">reply</span>{% endif %}
+      {% if row.quoted_id %}<span class="tag">quote</span>{% endif %}
+      <span class="spacer"></span>
+      {% if row.source_url %}<a class="muted small" href="{{ row.source_url }}" rel="noreferrer noopener" target="_blank">source &rarr;</a>{% endif %}
+    </div>
+  </article>
+  {% endfor %}
+</div>
+
+{% if pages > 1 %}
+<nav class="pager">
+  {% if page > 1 %}<a class="btn" href="{{ page_url(page - 1) }}">&larr; Newer</a>{% endif %}
+  <span class="muted small">page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a class="btn" href="{{ page_url(page + 1) }}">Older &rarr;</a>{% endif %}
+</nav>
+{% endif %}
+{% else %}
+<p class="empty">No posts match those filters. Collect some with
+  <code>magpie pull @handle</code> or start monitoring with <code>magpie monitor</code>.</p>
+{% endif %}
+{% endblock %}

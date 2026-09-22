@@ -278,6 +278,39 @@ def test_merge_prefers_untruncated_text_and_records_the_source() -> None:
     assert post.source_url == "https://x.com/archivist/status/20"
 
 
+def test_merge_does_not_duplicate_a_link_the_longer_source_repeats() -> None:
+    """Reuters' article link and its media entity share one t.co shortlink.
+
+    fxtwitter's raw_text therefore ends with the same URL twice. Adopting the
+    longer string stored "... sources say https://t.co/X https://t.co/X" for
+    every such post, which was visible in the UI.
+    """
+    body = "Traders push for discounts on oil, sources say https://t.co/s9KHztYePQ"
+    parsed = {
+        "syndication": _parsed("syndication", text=body, screen_name="Reuters"),
+        "fxtwitter": _parsed(
+            "fxtwitter", text=f"{body} https://t.co/s9KHztYePQ", screen_name="Reuters"
+        ),
+    }
+    post = merge(TweetRef(input="1", tweet_id="1", screen_name="Reuters"), parsed)
+
+    assert post.text == body
+    assert post.text.count("https://t.co/s9KHztYePQ") == 1
+
+
+def test_merge_still_recovers_a_genuinely_dropped_tail() -> None:
+    """The duplicate guard must not break the case it was added for."""
+    short = "La portada del 22 de septiembre."
+    full = f"{short} Noticia completa https://t.co/5GRFUfszbj"
+    parsed = {
+        "syndication": _parsed("syndication", text=short, screen_name="okdiario"),
+        "fxtwitter": _parsed("fxtwitter", text=full, screen_name="okdiario"),
+    }
+    post = merge(TweetRef(input="2", tweet_id="2", screen_name="okdiario"), parsed)
+
+    assert post.text == full
+
+
 def test_merge_falls_back_to_truncated_text_when_that_is_all_there_is() -> None:
     parsed = {
         "syndication": _parsed(

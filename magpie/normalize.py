@@ -759,12 +759,22 @@ def _pick_text(parsed: dict[str, ParsedSource]) -> tuple[str | None, str | None]
         which also drops an authored link (measured: `okdiario` lost
         "Noticia completa https://t.co/5GRFUfszbj"). When the chosen raw text
         is a strict prefix of another candidate's, take the longer one.
+
+        But only when the extra tail carries something new. Reuters posts a
+        link whose t.co is ALSO the media entity's shortlink, so fxtwitter's
+        raw_text repeats it verbatim; adopting the longer string stored
+        "... sources say https://t.co/X https://t.co/X". A tail that merely
+        repeats something already in the text is not recovered content.
         """
         chosen = source.text or ""
         for other in candidates:
             text = other.text or ""
-            if len(text) > len(chosen) and text.startswith(chosen):
-                chosen = text
+            if len(text) <= len(chosen) or not text.startswith(chosen):
+                continue
+            tail = text[len(chosen) :].strip()
+            if not tail or all(part in chosen for part in tail.split()):
+                continue
+            chosen = text
         return chosen, source.name
 
     for source in candidates:

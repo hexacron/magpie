@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Accounts · {{ settings.site_name }}{% endblock %}
+
+{% block content %}
+<section class="section-head">
+  <h1>Watched accounts</h1>
+  <span class="muted">{{ entries|length }} on the watchlist &middot; default every {{ default_interval|int }}s</span>
+</section>
+
+{% if entries %}
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Account</th>
+      <th class="num">Interval</th>
+      <th class="num">Polls</th>
+      <th class="num">New</th>
+      <th class="num">Stored</th>
+      <th class="num">Rollovers</th>
+      <th>Last poll</th>
+      <th>Latest post</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in entries %}
+    <tr{% if not e.enabled %} class="off"{% endif %}>
+      <td>
+        <a class="handle" href="{{ url('/posts') }}?user={{ e.handle }}">@{{ e.display }}</a>
+        {% if not e.enabled %}<span class="tag">disabled</span>{% endif %}
+        {% for tag in e.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+        {% if e.profile.followers %}
+          <div class="muted small">{{ e.profile.followers|num }} followers</div>
+        {% endif %}
+      </td>
+      <td class="num mono">{{ e.effective_interval|int }}s{% if not e.interval %}<span class="muted">*</span>{% endif %}</td>
+      <td class="num mono">{{ e.polls }}</td>
+      <td class="num mono">{{ e.new_posts }}</td>
+      <td class="num mono">{{ e.stored_posts|num }}</td>
+      <td class="num mono">
+        {% if e.rollovers %}<span class="warn">{{ e.rollovers }}</span>{% else %}0{% endif %}
+      </td>
+      <td class="mono small">{{ e.last_poll_utc|dt if e.last_poll_utc else '—' }}</td>
+      <td class="small">
+        {% if e.latest %}
+          <span class="muted mono">{{ e.latest.created_at_utc|dt }}</span><br>
+          {{ e.latest.text[:90] }}{% if e.latest.text|length > 90 %}…{% endif %}
+        {% else %}—{% endif %}
+      </td>
+    </tr>
+    {% if e.last_error %}
+    <tr class="err-row"><td colspan="8" class="small warn">{{ e.last_error }}</td></tr>
+    {% endif %}
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted small">
+  <span class="mono">*</span> using the global default. A poll where every id is new means the
+  profile page rolled over between polls and posts were missed — magpie halves that account's
+  interval automatically. Manage with <code>magpie watchlist</code>.
+</p>
+{% else %}
+<p class="empty">Nothing watched yet. Add accounts with
+  <code>magpie watchlist add @handle</code>, then run <code>magpie monitor</code>.</p>
+{% endif %}
+{% endblock %}
