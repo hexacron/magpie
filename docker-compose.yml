@@ -1,0 +1,48 @@
+services:
+  magpie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: magpie:2.0.0
+    container_name: magpie
+    restart: unless-stopped
+    env_file: .env
+    # env_file entries override the image's ENV, so a .env written for local
+    # use (MAGPIE_HOST=127.0.0.1, MAGPIE_DATA_DIR=./data) would make the container
+    # unreachable and write outside the volume. Pin the container-side values.
+    environment:
+      MAGPIE_HOST: 0.0.0.0
+      MAGPIE_PORT: 8099
+      MAGPIE_DATA_DIR: /data
+    ports:
+      - "127.0.0.1:8099:8099"
+    volumes:
+      - magpie-data:/data
+
+    # --- Reverse-proxy deployment -------------------------------------
+    # Do not expose this container directly on a public interface unless
+    # MAGPIE_AUTH_TOKEN is set. To run it behind nginx/Caddy/Traefik on the
+    # same host, bind the published port to loopback only:
+    #
+    #   ports:
+    #     - "127.0.0.1:8099:8099"
+    #
+    # Or drop `ports:` entirely, join the proxy's network, and let the
+    # proxy reach the service by name on port 8099:
+    #
+    #   expose:
+    #     - "8099"
+    #   networks:
+    #     - web
+    #
+    # If the proxy terminates TLS and adds X-Forwarded-*, set
+    # MAGPIE_TRUST_PROXY=1 in .env, and MAGPIE_BASE_PATH=/xw when it is mounted
+    # under a subpath.
+    # ------------------------------------------------------------------
+
+# networks:
+#   web:
+#     external: true
+
+volumes:
+  magpie-data:

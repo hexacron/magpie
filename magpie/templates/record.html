@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ tool }} record {{ tweet_id or folder }}</title>
+<meta name="generator" content="{{ tool }} {{ tool_version }}">
+<meta name="referrer" content="no-referrer">
+<style>{{ css | safe }}</style>
+</head>
+<body>
+<main class="record">
+
+  <header class="head">
+    <div class="head-main">
+      <h1>Capture record</h1>
+      <p class="sub">{{ tool }} {{ tool_version }} &middot; manifest v{{ manifest_version }}</p>
+    </div>
+    <dl class="head-meta">
+      <dt>Captured (UTC)</dt><dd class="mono">{{ capture_time or '-' }}</dd>
+      <dt>Post id</dt><dd class="mono">{{ tweet_id or 'unknown' }}</dd>
+      <dt>Package</dt><dd class="mono">{{ folder or '-' }}</dd>
+      <dt>Status</dt><dd><span class="pill pill-{{ status }}">{{ status }}</span></dd>
+      {% if operator %}
+      <dt>Operator</dt><dd>{{ operator }}</dd>
+      {% endif %}
+      {% if capture_duration_ms %}
+      <dt>Duration</dt><dd class="mono">{{ capture_duration_ms }} ms</dd>
+      {% endif %}
+    </dl>
+  </header>
+
+  {# ---------------------------------------------------------------- post #}
+  <section class="section">
+    <h2>The post</h2>
+    {% if post %}
+    <article class="post">
+      <div class="post-head">
+        {% if post.avatar_src %}
+        <img class="avatar" src="{{ post.avatar_src }}" alt="avatar of @{{ post.screen_name }}">
+        {% else %}
+        <div class="avatar avatar-blank">{{ post.initials }}</div>
+        {% endif %}
+        <div class="post-who">
+          <span class="post-name">{{ post.name or 'unknown' }}{% if post.blue_verified %} <span class="badge">verified</span>{% endif %}</span>
+          <span class="post-handle">@{{ post.screen_name or 'unknown' }}</span>
+        </div>
+        <div class="post-when mono">{{ post.created_at_utc or post.created_at_display or '' }}</div>
+      </div>
+
+      {% if post.reply_to_id %}
+      <p class="post-context">Reply to {% if post.reply_to_screen_name %}@{{ post.reply_to_screen_name }} &middot; {% endif %}<span class="mono">{{ post.reply_to_id }}</span></p>
+      {% endif %}
+
+      <div class="post-text">{{ post.text if post.text is not none else '(no text returned by any source)' }}</div>
+      {% if post.text_source %}
+      <p class="note">Text as returned by <span class="mono">{{ post.text_source }}</span>.</p>
+      {% endif %}
+
+      {% if post.community_note %}
+      <div class="callout">
+        <strong>Community note attached to the post</strong>
+        <div class="post-text">{{ post.community_note }}</div>
+      </div>
+      {% endif %}
+
+      {% if post.quoted_id %}
+      <p class="post-context">Quotes {% if post.quoted_screen_name %}@{{ post.quoted_screen_name }} &middot; {% endif %}<span class="mono">{{ post.quoted_id }}</span></p>
+      {% endif %}
+
+      {% if post.media %}
+      <div class="media">
+        {% for item in post.media %}
+        <figure class="media-item">
+          {% if item.is_video %}
+            {% if item.file %}
+          <video controls preload="metadata"{% if item.thumb_src %} poster="{{ item.thumb_src }}"{% endif %}>
+            <source src="{{ item.file }}" type="video/mp4">
+          </video>
+            {% elif item.thumb_src %}
+          <img src="{{ item.thumb_src }}" alt="{{ item.alt or 'video thumbnail' }}">
+            {% endif %}
+          {% elif item.src %}
+          <img src="{{ item.src }}" alt="{{ item.alt or 'attached image' }}">
+          {% endif %}
+          <figcaption>
+            <span class="mono">{{ item.kind }}</span>
+            {% if item.width and item.height %} &middot; {{ item.width }}&times;{{ item.height }}{% endif %}
+            {% if item.duration_s %} &middot; {{ item.duration_s }}s{% endif %}
+            {% if item.file %} &middot; stored as <span class="mono">{{ item.file }}</span> ({{ item.size }}){% else %} &middot; <span class="bad">not stored locally</span>{% endif %}
+            {% if item.error %} &middot; <span class="bad">{{ item.error }}</span>{% endif %}
+            {% if item.is_video %}
+            <br><span class="note">Video is referenced, not embedded: this document contains no video payload.</span>
+            {% endif %}
+            {% if item.sha256 %}<br><span class="mono hash">sha256 {{ item.sha256 }}</span>{% endif %}
+            {% if item.remote_url %}<br><span class="mono url">{{ item.remote_url }}</span>{% endif %}
+            {% if item.alt %}<br>alt text: {{ item.alt }}{% endif %}
+            {% if item.ocr_text %}<br><span class="note">OCR: {{ item.ocr_text }}</span>{% endif %}
+          </figcaption>
+        </figure>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </article>
+    {% else %}
+    <p class="bad">No post data: none of the sources returned a usable record for this id.</p>
+    {% endif %}
+  </section>
+
+  {# ----------------------------------------------------------- post facts #}
+  <section class="section">
+    <h2>Post facts</h2>
+    <table class="kv">
+      <tbody>
+      {% for label, value in facts %}
+        <tr><th>{{ label }}</th><td class="mono">{{ value }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  {# ----------------------------------------------------------- engagement #}
+  <section class="section">
+    <h2>Engagement</h2>
+    {% if engagement %}
+    <table class="grid">
+      <thead><tr><th>Metric</th><th class="num">Value</th><th>Source</th><th>Agreement</th></tr></thead>
+      <tbody>
+      {% for row in engagement %}
+        <tr>
+          <td>{{ row.label }}</td>
+          <td class="num mono">{{ row.value }}</td>
+          <td class="mono">{{ row.source }}</td>
+          <td class="{% if row.conflict %}bad{% elif row.single %}warn{% else %}good{% endif %}">{{ row.agreement }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="note">Counts are point-in-time values reported by the named endpoint at capture time. A metric marked <em>single source</em> was reported by exactly one endpoint and was therefore not corroborated.</p>
+    {% else %}
+    <p class="note">No engagement counts were returned by any source.</p>
+    {% endif %}
+  </section>
+
+  {# ------------------------------------------------------- sources fetched #}
+  <section class="section">
+    <h2>Sources fetched</h2>
+    {% if sources %}
+    <table class="grid">
+      <thead><tr><th>Source</th><th>HTTP</th><th>URL</th><th>Saved as</th><th>Server date</th><th>Size</th><th>Note</th></tr></thead>
+      <tbody>
+      {% for row in sources %}
+        <tr>
+          <td class="mono">{{ row.name }}</td>
+          <td class="mono {% if row.ok %}good{% else %}bad{% endif %}">{{ row.status }}</td>
+          <td class="mono url">{{ row.url }}</td>
+          <td class="mono">{{ row.saved_file }}</td>
+          <td class="mono">{{ row.date }}</td>
+          <td class="mono num">{{ row.bytes }}</td>
+          <td>{% if row.error %}<span class="bad">{{ row.error }}</span>{% elif row.elapsed_ms %}{{ row.elapsed_ms }} ms{% endif %}</td>
+        </tr>
+        {% if row.sha256 or row.tls %}
+        <tr class="subrow">
+          <td></td>
+          <td colspan="6" class="mono hash">
+            {% if row.sha256 %}response sha256 {{ row.sha256 }}{% endif %}
+            {% if row.tls %}<br>TLS {{ row.tls.get('version', '?') }} &middot; {{ row.tls.get('cipher', '?') }}{% if row.tls.get('issuer') %} &middot; issuer {{ row.tls.get('issuer') }}{% endif %}{% if row.tls.get('not_after') %} &middot; valid to {{ row.tls.get('not_after') }}{% endif %}{% endif %}
+          </td>
+        </tr>
+        {% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="note">Request and response headers for every source are recorded verbatim in <span class="mono">manifest.json</span>; the unmodified response bodies are stored beside this record.</p>
+    {% else %}
+    <p class="note">No sources were fetched.</p>
+    {% endif %}
+  </section>
+
+  {# ------------------------------------------------------------ crosscheck #}
+  <section class="section">
+    <h2>Cross-check</h2>
+    {% if crosscheck %}
+    <h3>Availability</h3>
+    <table class="kv">
+      <tbody>
+      {% for name, state in crosscheck.availability.items() %}
+        <tr><th class="mono">{{ name }}</th><td class="{% if state == 'available' %}good{% else %}warn{% endif %}">{{ state }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>Text</h3>
+    <p class="{% if crosscheck.text_conflict %}bad{% else %}good{% endif %}">Text agreement: {{ crosscheck.text_agreement }}{% if crosscheck.longest_source %} &middot; longest text from <span class="mono">{{ crosscheck.longest_source }}</span>{% endif %}</p>
+    {% if crosscheck.truncated %}
+    <p class="warn">Truncated (not a discrepancy): {% for name in crosscheck.truncated %}<span class="mono">{{ name }}</span>{% if not loop.last %}, {% endif %}{% endfor %} returned a text that is a strict prefix of the longest version. The syndication endpoint caps long posts at 280 characters; a shortened copy is recorded as truncation, not as a conflict.</p>
+    {% endif %}
+    {% if crosscheck.text_rows %}
+    <table class="grid">
+      <thead><tr><th>Source</th><th class="num">Characters</th><th>Note</th></tr></thead>
+      <tbody>
+      {% for row in crosscheck.text_rows %}
+        <tr>
+          <td class="mono">{{ row.source }}</td>
+          <td class="num mono">{{ row.chars }}</td>
+          <td>{% if row.truncated %}<span class="warn">truncated copy</span>{% else %}full text{% endif %}</td>
+        </tr>
+        {% if crosscheck.text_conflict %}
+        <tr class="subrow"><td></td><td colspan="2" class="post-text small">{{ row.text }}</td></tr>
+        {% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if crosscheck.counts %}
+    <h3>Counts</h3>
+    <table class="grid">
+      <thead><tr><th>Metric</th><th>Per source</th><th>Agreement</th></tr></thead>
+      <tbody>
+      {% for row in crosscheck.counts %}
+        <tr>
+          <td>{{ row.label }}</td>
+          <td class="mono">{{ row.per_source }}</td>
+          <td class="{% if row.conflict %}bad{% else %}good{% endif %}">{{ row.agreement }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if crosscheck.fields %}
+    <h3>Fields</h3>
+    <table class="grid">
+      <thead><tr><th>Field</th><th>Per source</th><th>Agreement</th></tr></thead>
+      <tbody>
+      {% for row in crosscheck.fields %}
+        <tr>
+          <td class="mono">{{ row.label }}</td>
+          <td class="mono">{{ row.per_source }}</td>
+          <td class="{% if row.conflict %}bad{% else %}good{% endif %}">{{ row.agreement }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    <h3>Flags</h3>
+    {% if crosscheck.flags %}
+    <ul class="flags">
+      {% for flag in crosscheck.flags %}
+      <li class="mono">{{ flag }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="good">No flags raised.</p>
+    {% endif %}
+    {% if crosscheck.notes %}
+    <ul class="notes">
+      {% for note in crosscheck.notes %}
+      <li>{{ note }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% else %}
+    <p class="note">No cross-check was performed.</p>
+    {% endif %}
+  </section>
+
+  {# --------------------------------------------------------------- version #}
+  {% if version %}
+  <section class="section">
+    <h2>Version history</h2>
+    <table class="kv">
+      <tbody>
+        <tr><th>This capture</th><td class="mono">version {{ version.number }}</td></tr>
+        <tr><th>Previous package</th><td class="mono">{{ version.previous_folder }}</td></tr>
+        <tr><th>Previously captured</th><td class="mono">{{ version.previous_capture_time_utc or '-' }}</td></tr>
+      </tbody>
+    </table>
+    {% if version.changes %}
+    <p>Changed since the previous capture:</p>
+    <ul class="changes">
+      {% for change in version.changes %}
+      <li>{{ change }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="note">Nothing observable changed since the previous capture.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {# -------------------------------------------------------------- warnings #}
+  {% if warnings %}
+  <section class="section">
+    <h2>Capture warnings</h2>
+    <ul class="notes">
+      {% for warning in warnings %}
+      <li class="warn">{{ warning }}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  {# ------------------------------------------------------------- integrity #}
+  <section class="section">
+    <h2>Integrity</h2>
+    {% if files %}
+    <table class="grid">
+      <thead><tr><th>File</th><th>SHA-256</th></tr></thead>
+      <tbody>
+      {% for name, digest in files %}
+        <tr><td class="mono">{{ name }}</td><td class="mono hash">{{ digest }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    <p class="note">capture.html, capture.pdf and capture.png are hashed after rendering; the complete file list with digests is in <span class="mono">manifest.json</span>, whose own digest is in <span class="mono">MANIFEST.sha256</span>.</p>
+    <p class="note">{{ timestamp.line }}</p>
+    <p class="note">Verify a package offline with <span class="mono">magpie verify &lt;folder&gt;</span>: it recomputes every digest listed in the manifest and re-checks the manifest digest.</p>
+  </section>
+
+  <footer class="disclaimer">
+    <h2>What this document is</h2>
+    <p>This is a private capture, made by {{ tool }} {{ tool_version }}, of what the public endpoints listed under <em>Sources fetched</em> returned at {{ capture_time or 'the stated capture time' }}. It records those responses and the differences between them; it does not establish that the post existed, was authored by the named account, or said anything in particular.</p>
+    <p>The digests above are computed by this tool on this machine. They prove that the stored files have not changed since the capture <em>only</em> to someone who trusts this tool and this machine. {% if timestamp.enabled %}An RFC 3161 token from {{ timestamp.tsa_url }} is stored as <span class="mono">timestamp.tsr</span>; that token, and only that token, is a third-party attestation, and it attests to a time, not to content authenticity.{% else %}No third-party attestation is present: no RFC 3161 timestamp was requested for this capture.{% endif %}</p>
+    <p><strong>capture.png and capture.pdf are renders of this record</strong>, produced from this HTML file offline. They are not screenshots of x.com and must not be presented as such.</p>
+    <p class="mono small">{{ folder }} &middot; generated by {{ tool }} {{ tool_version }} &middot; {{ capture_time }}</p>
+  </footer>
+
+</main>
+</body>
+</html>

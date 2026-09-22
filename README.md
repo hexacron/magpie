@@ -1,0 +1,296 @@
+# Magpie
+
+Self-hosted extraction of **public** X/Twitter post data into a queryable SQLite dataset,
+with an optional evidence mode that seals each post into a hashed, self-contained package.
+
+It never uses the X API, a login, or a cookie: everything it reads is reachable from a
+logged-out browser. Ships with a CLI (`magpie`) and a web UI. Runs locally or in a container.
+
+## Data extraction (the default workflow)
+
+```sh
+magpie pull @AFP @Reuters @BBCWorld       # poll profiles, hydrate, store
+magpie pull https://x.com/jack/status/20  # or a specific post
+magpie watch @AFP @Reuters --interval 300 # keep polling a watchlist
+magpie thread <post_id> --depth 2         # crawl outward from one post
+magpie posts "Trump OR Greenland" --limit 20
+magpie query "SELECT screen_name, count(*) n, sum(likes) FROM posts GROUP BY 1 ORDER BY n DESC"
+magpie dump jsonl -o posts.jsonl
+```
+
+Measured on this machine: **15 accounts, 75 posts, 7.9 s** (~9.5 posts/sec). Handles are
+polled concurrently and ids are hydrated concurrently within each handle.
+
+### What is actually reachable without a login
+
+| Surface | Yield |
+| --- | --- |
+| `x.com/<handle>` server-rendered page | **5-6 recent post ids** (pinned + latest). The only surface that reflects the last minutes. |
+| `x.com/<handle>/status/<id>` page | The post plus ~2 related/reply ids. |
+| **guest GraphQL `UserTweets`** | **~100 posts in one call** (`magpie pull --deep`). Anonymous guest token, no account. |
+| **guest GraphQL `TweetDetail`** | Whole threaded conversation in one call, when its query id is alive. |
+| **guest GraphQL `UserByScreenName`** | Full user object. |
+| syndication / fxtwitter / vxtwitter | Full hydration of any known id; fx and vx also return user profiles. |
+| `with_replies`, `/media`, `/search`, `/hashtag`, `/explore` | **Nothing.** Logged out these return an empty app shell. |
+| GraphQL `SearchTimeline`, `2/search/adaptive.json`, `1.1/search/*` | **Nothing.** Search requires a real account. |
+| `syndication.twitter.com/srv/timeline-profile` | `429` from most egress IPs. Off by default (`MAGPIE_DISCOVER_TIMELINE=1`). |
+
+### The guest API (`--deep`)
+
+`POST https://api.x.com/1.1/guest/activate.json` with the public web bearer returns an
+anonymous guest token; that token alone unlocks `UserTweets`, `TweetDetail` and
+`UserByScreenName`. No account, no cookies, nothing to get banned.
+
+Two measured caveats decide how it is wired:
+
+1. **It is breadth, not freshness.** What it returns varies by account: `@BBCWorld` gave
+   100 posts covering the last 4 days, while `@AFP` gave 102 posts spanning 2017-2025 with
+   an average of 7.9k likes — its high-engagement archive, not its recent output. The live
+   responses carried **no pagination cursor**, so you cannot page deeper. It therefore runs
+   only under `--deep` and never replaces the SSR poll that provides freshness.
+2. **Query ids rotate, fast.** The `TweetDetail` id verified working at the start of this
+   session returned `404` roughly thirty minutes later. A dead id is a `404` with an empty
+   body; `xapi.py` walks a candidate list, remembers the winner, reports
+   `no working query id for <op> (ids rotate; update QUERY_IDS)`, and the caller falls back
+   to the SSR path. Override without a code change: `MAGPIE_QUERY_ID_TWEETDETAIL=<id>`.
+
+**The consequence that matters:** a profile page exposes only ~5 posts, so coverage is a
+function of poll cadence. An account posting faster than 5 posts per interval will lose
+posts between polls. `magpie watch` detects this — when every discovered id in a round is new,
+it reports that the timeline rolled over and the interval is too long.
+
+Hydration deliberately skips `x_page` (~215 KB per post, adds nothing the JSON sources
+lack). `MAGPIE_PULL_SOURCES` defaults to `syndication,fxtwitter` — about 9 KB per post.
+
+### The dataset
+
+SQLite at `$MAGPIE_DATA_DIR/dataset.db`: `posts`, `users`, `media`, `cursors`, plus an FTS5
+index over post text. Re-polling a stored post updates its counters and `last_seen_utc`
+while preserving `first_seen_utc`, so engagement over time is recoverable. `magpie query` is
+read-only (`SELECT`/`WITH` only, no stacked statements, `PRAGMA query_only=ON`).
+
+## Evidence mode (optional)
+
+`magpie capture` and the web UI produce the sealed package described below — raw source
+responses, media, an HTML/PDF/PNG record, a SHA-256 manifest and an optional RFC 3161
+timestamp. Use it when provenance matters; it is slower and writes far more to disk. The
+extraction path above never touches it.
+
+## How it works
+
+For each post id, four unauthenticated sources are fetched in parallel:
+
+| Source | Endpoint | What it contributes |
+| --- | --- | --- |
+| `syndication` | `cdn.syndication.twimg.com/tweet-result?id=…&token=…` | Structured tweet JSON, author profile, media variants. Text of long posts is truncated at 280 chars. |
+| `fxtwitter` | `api.fxtwitter.com/<handle>/status/<id>` | Retweet/view/quote/bookmark counts, untruncated `raw_text`, community notes. |
+| `vxtwitter` | `api.vxtwitter.com/<handle>/status/<id>` | Independent second structured view for cross-checking. |
+| `x_page` | `https://x.com/<handle>/status/<id>` | The server-rendered HTML page, including `og:*` metadata and the post text. |
+
+The `syndication` token is derived from the post id (base-36 of `(id / 1e15) * pi`, with
+`.` and runs of `0` removed) at full precision. The handle need not be known in advance —
+`i` works as a placeholder for both `x.com` and `fxtwitter`.
+
+The raw bodies are stored verbatim, along with the request and response headers and
+best-effort TLS peer information. They are then parsed, merged into a single record, and
+cross-checked against each other. Disagreements are reported per field; a source whose text
+is merely a truncated prefix of another's is flagged `source_truncated:<name>` rather than
+as a content conflict. Media is downloaded to `media/` and referenced by relative path
+(images below `MAGPIE_INLINE_IMAGE_BYTES` are inlined into `capture.html`; video never is).
+Finally every immutable file is hashed, and the manifest hash can optionally be anchored
+with an RFC 3161 timestamp.
+
+Re-capturing the same post creates a new package linked to the previous one, with an
+explicit list of what changed.
+
+## Package layout
+
+```
+<data_dir>/captures/<YYYYMMDDTHHMMSSZ>_<handle|unknown>_<tweet_id>/
+  manifest.json  MANIFEST.sha256  meta.json  timestamp.tsr (optional)
+  capture.html  capture.pdf  capture.png
+  syndication.json  fxtwitter.json  vxtwitter.json  x_page.html
+  media/{avatar.jpg,banner.jpg,photo_01.jpg,video_01.mp4,video_01_thumb.jpg}
+```
+
+`MANIFEST.sha256` contains a single line: `<sha256>  manifest.json`.
+
+`manifest.json`, `MANIFEST.sha256`, `meta.json`, `timestamp.tsr` and `timestamp.txt` are
+**mutable** and are excluded from the hash tree. Everything else is hashed. Tags and notes
+live in `meta.json`, outside the hash chain by design — annotating a capture must never
+change its evidentiary hashes.
+
+## Quick start — local
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[all]"
+playwright install chromium        # optional: enables capture.pdf / capture.png
+
+magpie serve                           # web UI on http://127.0.0.1:8099
+magpie capture https://x.com/jack/status/20
+magpie verify 20240101T120000Z_jack_20
+```
+
+Rendering (`playwright`) and OCR (`pytesseract`, `pillow`, plus the `tesseract` binary) are
+optional. Without them the app still runs; the corresponding steps are skipped and recorded
+as warnings in the manifest.
+
+## CLI
+
+```
+magpie serve                          # run the web UI
+magpie capture <url|id> [...]         # capture one or more posts; reads stdin if given none
+magpie capture --json <url>           # emit the manifest as JSON on stdout
+magpie verify <folder> | --all        # recheck the hash chain of one or all packages
+magpie list [--limit N]               # recent captures from the index
+magpie export json|csv [-o FILE]      # dump the index
+magpie reindex                        # rebuild index.db from the packages on disk
+magpie config                         # print effective settings (MAGPIE_AUTH_TOKEN redacted)
+```
+
+## Quick start — Docker
+
+```sh
+cp .env.example .env
+# set MAGPIE_AUTH_TOKEN in .env before exposing this anywhere
+docker compose up -d
+docker compose exec magpie magpie capture https://x.com/jack/status/20
+```
+
+The image includes Chromium and tesseract. Captures persist in the `magpie-data` volume mounted
+at `/data`.
+
+## Configuration
+
+Every setting is an environment variable. See `.env.example`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MAGPIE_DATA_DIR` | `./data` | Root for `captures/` and `index.db` |
+| `MAGPIE_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` in the container image) |
+| `MAGPIE_PORT` | `8099` | Bind port |
+| `MAGPIE_BASE_PATH` | *(empty)* | Subpath prefix when behind a reverse proxy |
+| `MAGPIE_SITE_NAME` | `Magpie` | Title in the web UI |
+| `MAGPIE_AUTH_TOKEN` | *(unset)* | Token required for all mutating routes |
+| `MAGPIE_PUBLIC_READ` | `1` | `0` requires the token for reads as well |
+| `MAGPIE_TRUST_PROXY` | `0` | Honour `X-Forwarded-*` headers |
+| `MAGPIE_SOURCES` | `syndication,fxtwitter,vxtwitter,x_page` | Sources to fetch |
+| `MAGPIE_HTTP_TIMEOUT` | `20.0` | Per-request timeout, seconds |
+| `MAGPIE_HTTP_RETRIES` | `2` | Retries per source |
+| `MAGPIE_PROXY` | *(unset)* | Outbound proxy URL for source fetches |
+| `MAGPIE_MAX_BATCH` | `25` | Max inputs accepted per batch |
+| `MAGPIE_CONCURRENCY` | `4` | Parallel captures per batch |
+| `MAGPIE_CAPTURE_TLS` | `1` | Record TLS peer info with response headers |
+| `MAGPIE_UA_SYNDICATION` | Chrome UA | Per-source User-Agent override |
+| `MAGPIE_UA_FXTWITTER` | plain client UA | Per-source User-Agent override |
+| `MAGPIE_UA_VXTWITTER` | plain client UA | **Must stay non-browser** or vxtwitter returns 403 |
+| `MAGPIE_UA_X_PAGE` | Chrome UA | Per-source User-Agent override |
+| `MAGPIE_USER_AGENT` | *(unset)* | Overrides the User-Agent for every source |
+| `MAGPIE_DOWNLOAD_MEDIA` | `1` | Download avatars, images and video |
+| `MAGPIE_MAX_MEDIA_BYTES` | `134217728` | Per-asset size cap (128 MiB) |
+| `MAGPIE_OCR` | `1` | OCR images when tesseract is available |
+| `MAGPIE_RENDER` | `1` | Render `capture.pdf` / `capture.png` |
+| `MAGPIE_RENDER_PDF` | `1` | Render the PDF |
+| `MAGPIE_RENDER_PNG` | `1` | Render the full-page PNG |
+| `MAGPIE_CHROMIUM_PATH` | *(unset)* | Explicit Chromium executable |
+| `MAGPIE_RENDER_TIMEOUT` | `60.0` | Render timeout, seconds |
+| `MAGPIE_INLINE_IMAGE_BYTES` | `2000000` | Images under this size are inlined into `capture.html` |
+| `MAGPIE_TSA` | `0` | Enable RFC 3161 timestamping of the manifest hash |
+| `MAGPIE_TSA_URL` | `https://freetsa.org/tsr` | Timestamp authority endpoint |
+| `MAGPIE_TSA_TIMEOUT` | `20.0` | TSA request timeout, seconds |
+| `MAGPIE_OPERATOR` | *(unset)* | Operator recorded in each manifest |
+
+## The evidence model
+
+What the hash chain **does** prove: the files in a package have not changed since the
+manifest was written, and the manifest itself matches `MANIFEST.sha256`. Anyone with the
+package can recompute this independently — no trust in this software required.
+
+What it **does not** prove:
+
+- **When** the capture happened. The timestamp in the manifest is whatever clock the
+  capturing machine had. It is self-asserted.
+- **That the post said what the package says.** The package proves what these four
+  endpoints returned to this client. It is not a statement from X.
+- **That the operator did not fabricate the package.** Whoever runs the tool controls the
+  inputs and could produce a consistent package from invented data.
+
+RFC 3161 timestamping (`MAGPIE_TSA=1`) is what closes the first gap: a third-party timestamp
+authority signs the manifest hash, establishing that the manifest — and therefore the hashed
+files — existed no later than the time in `timestamp.tsr`. Without it, a capture is a
+self-signed claim. Cross-checking four independent sources raises the cost of the third gap
+but does not eliminate it.
+
+## Verification
+
+```sh
+magpie verify <folder>
+```
+
+This recomputes the hash tree, compares it against `manifest.json`, checks
+`MANIFEST.sha256`, and validates the RFC 3161 token if present. It reports each file as
+`ok`, `modified`, `missing`, or `extra`.
+
+The equivalent by hand, inside the package directory:
+
+```sh
+# 1. manifest integrity
+sha256sum -c MANIFEST.sha256
+
+# 2. file integrity: every hash in manifest.json["files"]
+python -c 'import json,hashlib,pathlib
+m=json.load(open("manifest.json"))
+for rel,want in m["files"].items():
+    got=hashlib.sha256(pathlib.Path(rel).read_bytes()).hexdigest()
+    print(("ok  " if got==want else "BAD "),rel)'
+
+# 3. RFC 3161 token, if timestamp.tsr exists
+openssl ts -reply -in timestamp.tsr -text
+openssl ts -verify -digest "$(cut -d' ' -f1 MANIFEST.sha256)" \
+    -in timestamp.tsr -CAfile tsa-ca.pem
+```
+
+The TSA's CA certificate is not bundled; fetch it from the authority named in
+`MAGPIE_TSA_URL`.
+
+## Security
+
+**Write routes are open unless `MAGPIE_AUTH_TOKEN` is set.** With no token, anyone who can
+reach the instance can trigger captures, edit tags and notes, and delete packages. Do not
+expose an instance to a network you do not control without setting it. Set
+`MAGPIE_PUBLIC_READ=0` as well if captures should not be readable anonymously.
+
+The container binds `0.0.0.0` inside its namespace; the published port is what determines
+exposure. Bind it to `127.0.0.1` and put a TLS-terminating reverse proxy in front — see the
+commented block in `docker-compose.yml`. Enable `MAGPIE_TRUST_PROXY=1` only when a proxy you
+control sets `X-Forwarded-*`.
+
+Captures perform outbound requests to attacker-influenced URLs (media referenced by a post).
+Media size is capped by `MAGPIE_MAX_MEDIA_BYTES`; run the service with no privileged network
+access it does not need.
+
+## Legal and ethics
+
+This tool captures **public** posts only. It performs no authentication, uses no API key or
+session cookie, and contains no mechanism to access protected accounts, deleted content, or
+anything else gated behind a login. It reads the same endpoints a logged-out browser reads.
+
+It is **not** a third-party attestation service. A package is evidence of what a specific
+client received at a specific time on a specific machine, made verifiable against tampering
+after the fact. Presenting it as proof of publication is a claim about the capture process,
+not something this software can certify on your behalf. Where that matters, enable RFC 3161
+timestamping and retain the operator identity in `MAGPIE_OPERATOR`.
+
+Respect the terms of service of the endpoints you query and the privacy of the people whose
+posts you archive. Capturing a public post does not make redistributing it lawful.
+
+## Authors
+
+Built by [hexacron](https://github.com/hexacron) and Claude (Anthropic), pair-programmed
+end to end: every endpoint claim in this README was measured against live X responses
+during development rather than taken from documentation or prior art.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

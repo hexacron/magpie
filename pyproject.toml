@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magpie"
+version = "2.0.0"
+description = "Self-hosted extraction of public X/Twitter post data into a queryable dataset, with an optional hashed-evidence capture mode"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "hexacron" },
+    { name = "Claude", email = "noreply@anthropic.com" },
+]
+keywords = ["x", "twitter", "scraper", "osint", "dataset", "archive", "evidence", "rfc3161"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Legal Industry",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Security",
+]
+dependencies = [
+    "httpx>=0.27",
+    "jinja2>=3.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+render = ["playwright>=1.44"]
+ocr = ["pytesseract>=0.3.10", "pillow>=10"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+all = ["playwright>=1.44", "pytesseract>=0.3.10", "pillow>=10"]
+
+[project.scripts]
+magpie = "magpie.cli:main"
+
+[tool.hatch.build.targets.wheel]
+# templates/ and static/ live inside the package dir, so hatchling ships them
+# already; a force-include here adds them a second time and the build aborts.
+packages = ["magpie"]
+
+[tool.hatch.build.targets.sdist]
+include = ["magpie", "tests", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

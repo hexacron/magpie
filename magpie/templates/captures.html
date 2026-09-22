@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Captures &middot; {{ settings.site_name }}{% endblock %}
+{% block content %}
+
+<form class="panel filters" method="get" action="{{ url('/captures') }}">
+  <label class="field">
+    <span>Text</span>
+    <input type="search" name="q" value="{{ filters.q or '' }}" placeholder="text, note or OCR">
+  </label>
+  <label class="field">
+    <span>Handle</span>
+    <input type="text" name="user" value="{{ filters.user or '' }}" placeholder="@handle">
+  </label>
+  <label class="field">
+    <span>Capture date</span>
+    <input type="date" name="date" value="{{ filters.date or '' }}">
+  </label>
+  <label class="field">
+    <span>Tag</span>
+    <input type="text" name="tag" value="{{ filters.tag or '' }}" placeholder="case-42">
+  </label>
+  <label class="field">
+    <span>Status</span>
+    <select name="status">
+      <option value=""{% if not filters.status %} selected{% endif %}>any</option>
+      {%- for option in ['live', 'unavailable', 'error'] %}
+      <option value="{{ option }}"{% if filters.status == option %} selected{% endif %}>{{ option }}</option>
+      {%- endfor %}
+    </select>
+  </label>
+  <div class="filter-actions">
+    <button class="primary" type="submit">Filter</button>
+    <a class="linkish" href="{{ url('/captures') }}">Reset</a>
+  </div>
+</form>
+
+<div class="result-line">
+  <span><b>{{ total }}</b> capture{{ '' if total == 1 else 's' }}</span>
+  {%- if pages > 1 %}<span class="muted">page {{ page }} of {{ pages }}</span>{% endif %}
+</div>
+
+{% if rows %}
+<div class="grid">
+  {%- for row in rows %}{{ capture_card(row) }}{% endfor -%}
+</div>
+
+{% if pages > 1 %}
+<nav class="pager">
+  {%- if page > 1 %}<a href="{{ page_url(page - 1) }}">&larr; Newer</a>{% else %}<span class="off">&larr; Newer</span>{% endif %}
+  {%- for n in range(1, pages + 1) %}
+    {%- if n == 1 or n == pages or (n >= page - 2 and n <= page + 2) %}
+      {%- if n == page %}<span class="here">{{ n }}</span>
+      {%- else %}<a href="{{ page_url(n) }}">{{ n }}</a>{% endif %}
+    {%- elif n == page - 3 or n == page + 3 %}<span class="gap">&hellip;</span>
+    {%- endif %}
+  {%- endfor %}
+  {%- if page < pages %}<a href="{{ page_url(page + 1) }}">Older &rarr;</a>{% else %}<span class="off">Older &rarr;</span>{% endif %}
+</nav>
+{% endif %}
+
+{% else %}
+<p class="empty">No capture matches those filters.</p>
+{% endif %}
+
+{% endblock %}

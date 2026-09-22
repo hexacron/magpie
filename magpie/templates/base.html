@@ -1,0 +1,94 @@
+{%- macro status_pill(status) -%}
+{%- set s = status or 'unknown' -%}
+<span class="pill pill-{{ s }}">{{ s }}</span>
+{%- endmacro -%}
+
+{%- macro token_field() -%}
+{%- if needs_token %}
+<label class="field field-token">
+  <span>Access token</span>
+  <input type="password" name="token" autocomplete="current-password" placeholder="MAGPIE_AUTH_TOKEN">
+</label>
+{% endif -%}
+{%- endmacro -%}
+
+{%- macro capture_card(row) -%}
+<article class="card">
+  <a class="card-head" href="{{ url('/capture/' ~ row.folder) }}">
+    <span class="handle">@{{ row.screen_name or 'unknown' }}</span>
+    {{ status_pill(row.status) }}
+  </a>
+  <p class="card-text">{{ (row.text or '(no text captured)')|truncate(180, true, '…') }}</p>
+  <div class="card-meta">
+    <span title="Capture time">{{ row.capture_time_utc|dt }}</span>
+    {%- if row.media_count %}<span>{{ row.media_count }} media</span>{% endif -%}
+    {%- if row.flags %}<span class="meta-flag">{{ row.flags|length }} flag{{ '' if row.flags|length == 1 else 's' }}</span>{% endif -%}
+    {%- if row.timestamped %}<span class="meta-ok" title="RFC 3161 timestamp present">tsa</span>{% endif -%}
+    {%- if row.version and row.version > 1 %}<span title="Capture version">v{{ row.version }}</span>{% endif -%}
+  </div>
+  {%- if row.tags %}
+  <div class="tags">
+    {%- for tag in row.tags %}<a class="tag" href="{{ url('/captures?tag=' ~ tag|urlencode) }}">#{{ tag }}</a>{% endfor -%}
+  </div>
+  {%- endif %}
+</article>
+{%- endmacro -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{% block title %}{{ settings.site_name }}{% endblock %}</title>
+<link rel="stylesheet" href="{{ url('/static/style.css') }}">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{ url('/') }}"><b>X</b>Whisperer<small>{{ tool_version }}</small></a>
+  <nav class="nav">
+    <a href="{{ url('/') }}"{% if path == url('/') %} class="on"{% endif %}>New capture</a>
+    <a href="{{ url('/captures') }}"{% if '/captures' in path %} class="on"{% endif %}>Captures</a>
+  </nav>
+  <form class="search" action="{{ url('/captures') }}" method="get" role="search">
+    <input type="search" name="q" value="{{ (filters.q if filters else '') or '' }}" placeholder="search text, handle, OCR…" aria-label="Search captures">
+    <button type="submit">Search</button>
+  </form>
+  <div class="who">
+    {%- if settings.auth_token %}
+      {%- if authed %}
+      <form method="post" action="{{ url('/logout') }}"><button class="linkish" type="submit">Sign out</button></form>
+      {%- else %}
+      <a class="linkish" href="{{ url('/login') }}">Sign in</a>
+      {%- endif %}
+    {%- endif %}
+  </div>
+</header>
+
+{% if auth_open %}
+<div class="banner banner-warn">
+  <b>Unauthenticated instance.</b> No <code>MAGPIE_AUTH_TOKEN</code> is set, so anyone who can
+  reach this server can capture, tag and delete evidence. Set the token before exposing it.
+</div>
+{% endif %}
+{% if error %}<div class="banner banner-error">{{ error }}</div>{% endif %}
+{% if message %}<div class="banner banner-ok">{{ message }}</div>{% endif %}
+
+<main class="wrap">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="foot">
+  <p>
+    Captures public posts from unauthenticated endpoints and hashes the result.
+    A hash proves the package has not changed since capture &mdash; it does not
+    prove the post was authentic, and it is only as trustworthy as this instance
+    unless an RFC&nbsp;3161 timestamp is attached.
+  </p>
+  <p class="foot-links">
+    <a href="{{ url('/export/json') }}">Export JSON</a>
+    <a href="{{ url('/export/csv') }}">Export CSV</a>
+    <a href="{{ url('/healthz') }}">Health</a>
+  </p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,307 @@
+{% extends "base.html" %}
+{% block title %}@{{ manifest.screen_name or 'unknown' }} &middot; {{ manifest.tweet_id or folder }}{% endblock %}
+{% block content %}
+
+<div class="detail">
+
+<div class="record">
+  <div class="record-bar">
+    <div>
+      <span class="handle">@{{ manifest.screen_name or 'unknown' }}</span>
+      {{ status_pill(manifest.status) }}
+      <span class="muted">captured {{ manifest.capture_time_utc|dt }}</span>
+    </div>
+    <div class="record-bar-links">
+      {%- if has_record %}
+      <a href="{{ url('/capture/' ~ folder ~ '/view') }}" target="_blank" rel="noopener noreferrer">Open record</a>
+      {%- endif %}
+      {%- if post.source_url %}
+      <a href="{{ post.source_url }}" target="_blank" rel="noopener noreferrer nofollow">Original</a>
+      {%- endif %}
+    </div>
+  </div>
+  {% if has_record %}
+  <iframe class="record-frame" src="{{ url('/capture/' ~ folder ~ '/view') }}"
+          title="Captured record" sandbox="allow-same-origin" loading="lazy"></iframe>
+  {% else %}
+  <div class="record-missing">
+    <p>No rendered record for this capture.</p>
+    {%- if render.get('error') %}<p class="muted">{{ render.get('error') }}</p>{% endif %}
+    {%- if post.text %}<pre class="raw-text">{{ post.text }}</pre>{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<aside class="panels">
+
+  <section class="panel">
+    <h2>Status</h2>
+    <dl class="kv">
+      <dt>Status</dt><dd>{{ status_pill(manifest.status) }}</dd>
+      <dt>Post id</dt><dd class="mono">{{ manifest.tweet_id or '-' }}</dd>
+      <dt>Author</dt><dd>@{{ manifest.screen_name or 'unknown' }}{% if post.name %} <span class="muted">{{ post.name }}</span>{% endif %}</dd>
+      <dt>Posted</dt><dd>{{ post.created_at_utc|dt if post.created_at_utc else '-' }}</dd>
+      <dt>Captured</dt><dd>{{ manifest.capture_time_utc|dt('%Y-%m-%d %H:%M:%S') }}</dd>
+      <dt>Took</dt><dd>{% if manifest.capture_duration_ms %}{{ manifest.capture_duration_ms|num }} ms{% else %}-{% endif %}</dd>
+      <dt>Input</dt><dd class="mono break">{{ manifest.input }}</dd>
+      <dt>Folder</dt><dd class="mono break">{{ folder }}</dd>
+      {%- if manifest.operator %}<dt>Operator</dt><dd>{{ manifest.operator }}</dd>{% endif %}
+      <dt>Render</dt>
+      <dd>
+        {%- for kind in ['html', 'pdf', 'png'] -%}
+        <span class="chip chip-{{ 'ok' if render.get(kind) else 'off' }}">{{ kind }}</span>
+        {%- endfor %}
+        {%- if render.engine %} <span class="muted">{{ render.engine }}</span>{% endif %}
+      </dd>
+    </dl>
+
+    {% if post.counts %}
+    <div class="metrics">
+      {%- for key, value in post.counts.items() %}
+      <div class="metric{{ ' metric-split' if post.get('count_agreement', {}).get(key) is false else '' }}"
+           title="{{ post.get('count_sources', {}).get(key, 'unknown source') }}{% if post.get('count_agreement', {}).get(key) is false %} — sources disagree{% endif %}">
+        <b>{{ value|num }}</b><span>{{ key }}</span>
+      </div>
+      {%- endfor %}
+    </div>
+    {% endif %}
+
+    <table class="sources">
+      <thead><tr><th>Source</th><th>HTTP</th><th>Time</th><th>Size</th></tr></thead>
+      <tbody>
+      {%- for src in sources %}
+        <tr class="{{ 'row-ok' if src.ok else 'row-bad' }}">
+          <td>
+            {{ src.name }}
+            <div class="muted small">{{ crosscheck.get('availability', {}).get(src.name, '-') }}</div>
+          </td>
+          <td class="mono">{{ src.http_status or '-' }}</td>
+          <td class="mono">{{ src.elapsed_ms|num }}&thinsp;ms</td>
+          <td class="mono">{{ (src.bytes or 0)|filesizeformat }}</td>
+        </tr>
+        <tr class="row-detail">
+          <td colspan="4">
+            <details>
+              <summary>request / response evidence</summary>
+              <div class="evidence">
+                <p class="mono break">{{ src.url }}</p>
+                {%- if src.error %}<p class="bad">{{ src.error }}</p>{% endif %}
+                {%- if src.body_sha256 %}<p class="mono break">body sha256 {{ src.body_sha256 }}</p>{% endif %}
+                {%- if src.saved_file %}
+                <p><a href="{{ url('/capture/' ~ folder ~ '/file/' ~ src.saved_file) }}">{{ src.saved_file }}</a></p>
+                {%- endif %}
+                {%- if src.tls %}
+                <h4>TLS</h4>
+                <dl class="kv small">
+                  {%- for key, value in src.tls.items() %}<dt>{{ key }}</dt><dd class="mono break">{{ value }}</dd>{% endfor %}
+                </dl>
+                {%- endif %}
+                {%- if src.request_headers %}
+                <h4>Request headers</h4>
+                <dl class="kv small">
+                  {%- for key, value in src.request_headers.items() %}<dt>{{ key }}</dt><dd class="mono break">{{ value }}</dd>{% endfor %}
+                </dl>
+                {%- endif %}
+                {%- if src.headers %}
+                <h4>Response headers</h4>
+                <dl class="kv small">
+                  {%- for key, value in src.headers.items() %}<dt>{{ key }}</dt><dd class="mono break">{{ value }}</dd>{% endfor %}
+                </dl>
+                {%- endif %}
+              </div>
+            </details>
+          </td>
+        </tr>
+      {%- else %}
+        <tr><td colspan="4" class="muted">No source was fetched.</td></tr>
+      {%- endfor %}
+      </tbody>
+    </table>
+
+    {% if warnings %}
+    <ul class="warnings">
+      {%- for warning in warnings %}<li>{{ warning }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Integrity</h2>
+    <dl class="kv">
+      <dt>manifest.json</dt>
+      <dd>
+        <span class="mono break">{{ manifest_sha256 or 'not recorded' }}</span>
+        {%- if manifest_sha256 %}
+        <button class="copy" type="button" data-copy="{{ manifest_sha256 }}">copy</button>
+        {%- endif %}
+      </dd>
+      <dt>Files hashed</dt><dd>{{ (manifest.files or {})|length }}</dd>
+      <dt>Timestamp</dt>
+      <dd>
+        {%- if stamp.get('ok') %}
+        <span class="chip chip-ok">RFC 3161</span>
+        <div class="small muted">{{ stamp.get('gen_time')|dt('%Y-%m-%d %H:%M:%S') }} &middot; {{ stamp.get('tsa_url') }}</div>
+        {%- elif stamp.get('enabled') %}
+        <span class="chip chip-bad">failed</span>
+        <div class="small bad">{{ stamp.get('error') or 'unknown error' }}</div>
+        {%- else %}
+        <span class="chip chip-off">not anchored</span>
+        <div class="small muted">Hashes are self-computed. Enable <code>MAGPIE_TSA</code> to have a
+          third party attest to the capture time.</div>
+        {%- endif %}
+      </dd>
+    </dl>
+
+    {% if verify %}
+    <div class="verify {{ 'verify-ok' if verify.ok else 'verify-bad' }}">
+      <b>{{ 'Package intact' if verify.ok else 'Package does NOT verify' }}</b>
+      <div class="small">{{ verify.files_checked }} file{{ '' if verify.files_checked == 1 else 's' }} checked</div>
+      {%- if verify.recorded_manifest_sha256 and verify.manifest_sha256 != verify.recorded_manifest_sha256 %}
+      <div class="small bad">manifest digest does not match MANIFEST.sha256</div>
+      {%- endif %}
+      {%- for label, items in [('mismatched', verify.mismatched), ('missing', verify.missing), ('unexpected', verify.unexpected), ('errors', verify.errors)] %}
+        {%- if items %}
+      <div class="small bad">{{ label }}: {{ items|join(', ') }}</div>
+        {%- endif %}
+      {%- endfor %}
+      {%- if verify.timestamp_ok is not none %}
+      <div class="small">timestamp token: {{ 'valid' if verify.timestamp_ok else 'invalid' }}</div>
+      {%- endif %}
+    </div>
+    {% endif %}
+    <p><a class="button" href="{{ url('/capture/' ~ folder ~ '/verify') }}">Verify package</a></p>
+  </section>
+
+  <section class="panel">
+    <h2>Flags <span class="count">{{ flags|length }}</span></h2>
+    {% if flags %}
+    <ul class="flags">
+      {%- for flag in flags %}{% set info = flag_info(flag) %}
+      <li class="flag flag-{{ info.level }}">
+        <b>{{ info.label }}</b>
+        <span class="mono small">{{ info.flag }}</span>
+        <p>{{ info.detail }}</p>
+      </li>
+      {%- endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">No discrepancy between the sources.</p>
+    {% endif %}
+    {% if crosscheck.get('notes') %}
+    <ul class="notes">
+      {%- for note in crosscheck.get('notes') %}<li>{{ note }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Versions</h2>
+    <p class="muted small">
+      Capture {{ version.get('version', 1) }} of this post.
+      {%- if version.get('previous_folder') %} Previous capture {{ version.get('previous_capture_time_utc')|dt }}.{% endif %}
+    </p>
+    {% if version.get('changes') %}
+    <ul class="changes">
+      {%- for change in version.get('changes') %}<li>{{ change }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if versions|length > 1 %}
+    <ol class="versions">
+      {%- for other in versions %}
+      <li class="{{ 'here' if other.folder == folder else '' }}">
+        <a href="{{ url('/capture/' ~ other.folder) }}">v{{ other.version }} &middot; {{ other.capture_time_utc|dt }}</a>
+        <span class="muted small">{{ other.status }}</span>
+      </li>
+      {%- endfor %}
+    </ol>
+    {% elif not version.get('previous_folder') %}
+    <p class="muted small">No earlier capture of this post in this instance.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Downloads</h2>
+    <p><a class="button" href="{{ url('/capture/' ~ folder ~ '/zip') }}">Download package .zip</a></p>
+    <table class="files">
+      <tbody>
+      {%- for file in files %}
+      <tr>
+        <td><a href="{{ url('/capture/' ~ folder ~ '/file/' ~ file.rel) }}">{{ file.label }}</a>
+          {%- if file.primary and file.label != file.rel %}<div class="muted small mono">{{ file.rel }}</div>{% endif %}</td>
+        <td class="mono nowrap">{{ file.size|filesizeformat }}</td>
+        <td class="mono small break">{{ file.sha256|shorthash if file.sha256 else '—' }}</td>
+      </tr>
+      {%- else %}
+      <tr><td class="muted">Package is empty.</td></tr>
+      {%- endfor %}
+      </tbody>
+    </table>
+    <p class="hint">Digests cover every file except the mutable ones
+      (<code>manifest.json</code>, <code>MANIFEST.sha256</code>, <code>meta.json</code>,
+      <code>timestamp.*</code>).</p>
+  </section>
+
+  <section class="panel">
+    <h2>Tags &amp; note</h2>
+    <form method="post" action="{{ url('/capture/' ~ folder ~ '/meta') }}">
+      <label class="field">
+        <span>Tags</span>
+        <input type="text" name="tags" value="{{ (meta.get('tags') or [])|join(', ') }}" placeholder="case-42, osint">
+      </label>
+      <label class="field">
+        <span>Note</span>
+        <textarea name="note" rows="3" placeholder="Why this was captured">{{ meta.get('note') or '' }}</textarea>
+      </label>
+      {{ token_field() }}
+      <button class="primary" type="submit">Save</button>
+    </form>
+    <p class="hint">Tags and notes are yours, not evidence: they live in
+      <code>meta.json</code>, outside the hash chain, and never change a digest.</p>
+  </section>
+
+  <section class="panel danger">
+    <h2>Danger zone</h2>
+    <form method="post" action="{{ url('/capture/' ~ folder ~ '/delete') }}">
+      {{ token_field() }}
+      <label class="check">
+        <input type="checkbox" name="confirm" value="yes" required>
+        <span>I understand this deletes the package and every file in it.</span>
+      </label>
+      <button class="destructive" type="submit">Delete capture</button>
+    </form>
+    <p class="hint">Removes the package directory and its index row. Not undoable.</p>
+  </section>
+
+</aside>
+</div>
+
+<script>
+// The only script in the app: copy the manifest digest, and fall back to
+// selecting it when the clipboard API is unavailable.
+document.addEventListener('click', function (event) {
+  var button = event.target.closest('[data-copy]');
+  if (!button) { return; }
+  var label = button.textContent;
+  var flash = function (text) {
+    button.textContent = text;
+    setTimeout(function () { button.textContent = label; }, 1400);
+  };
+  var select = function () {
+    var node = button.parentNode.querySelector('.mono');
+    if (!node || !window.getSelection) { return flash('copy failed'); }
+    var range = document.createRange();
+    range.selectNodeContents(node);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    flash('selected');
+  };
+  if (!navigator.clipboard || !navigator.clipboard.writeText) { return select(); }
+  navigator.clipboard.writeText(button.getAttribute('data-copy')).then(
+    function () { flash('copied'); },
+    select
+  );
+});
+</script>
+
+{% endblock %}

@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}{{ settings.site_name }}{% endblock %}
+{% block content %}
+
+{% if login %}
+<section class="panel narrow">
+  <h1>Sign in</h1>
+  <p class="muted">This instance is private. Paste the access token to continue.</p>
+  <form method="post" action="{{ url('/login') }}">
+    <input type="hidden" name="next" value="{{ next_url }}">
+    <label class="field">
+      <span>Access token</span>
+      <input type="password" name="token" autocomplete="current-password" autofocus required>
+    </label>
+    <button class="primary" type="submit">Sign in</button>
+  </form>
+  <p class="hint">The token is stored in a host-only cookie. API clients can send
+    <code>Authorization: Bearer &lt;token&gt;</code> instead.</p>
+</section>
+
+{% else %}
+<section class="hero">
+  <h1>Capture a public post as verifiable evidence.</h1>
+  <p>
+    {{ settings.sources|length }} unauthenticated sources, cross-checked and merged,
+    rendered to HTML/PDF/PNG, then hashed file by file{% if settings.tsa %} and anchored
+    with an RFC&nbsp;3161 timestamp{% endif %}. No API key, no login, nothing of yours sent to X.
+  </p>
+</section>
+
+<form class="panel capture-form" method="post" action="{{ url('/capture') }}">
+  <label class="field">
+    <span>Posts to capture</span>
+    <textarea name="links" rows="5" required spellcheck="false" autofocus
+      placeholder="https://x.com/jack/status/20&#10;https://twitter.com/jack/status/20&#10;20"></textarea>
+  </label>
+  <p class="hint">
+    One per line, max {{ settings.max_batch }}. Full URL, mobile URL, or a bare numeric post id
+    &mdash; anything that is not an X/Twitter link is rejected instead of guessed at.
+  </p>
+  {{ token_field() }}
+  <button class="primary" type="submit">Capture</button>
+</form>
+
+{% if stats %}
+<section class="stats">
+  {%- for key, value in stats.items() %}
+    {%- if value is string or value is number %}
+  <div class="stat">
+    <b>
+      {%- if value is boolean %}{{ 'yes' if value else 'no' }}
+      {%- elif key.endswith('bytes') and value is number %}{{ value|filesizeformat }}
+      {%- elif value is string and 'T' in value %}{{ value|date }}
+      {%- elif value is number %}{{ value|num }}
+      {%- else %}{{ value }}{% endif -%}
+    </b>
+    <span>{{ key|replace('_', ' ') }}</span>
+  </div>
+    {%- endif %}
+  {%- endfor %}
+</section>
+{% endif %}
+
+<section class="section">
+  <h2>Recent captures</h2>
+  {% if recent %}
+  <div class="grid">
+    {%- for row in recent %}{{ capture_card(row) }}{% endfor -%}
+  </div>
+  <p class="more"><a href="{{ url('/captures') }}">All captures &rarr;</a></p>
+  {% else %}
+  <p class="empty">Nothing captured yet. Paste a post link above.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% endblock %}
