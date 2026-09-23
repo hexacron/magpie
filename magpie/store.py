@@ -116,6 +116,11 @@ CSV_HEADER: tuple[str, ...] = (
     "text",
 )
 
+#: A capture folder is always ``<stamp>_<handle>_<id>``; nothing else is served.
+#: Lives here beside ``package_path``, the function it guards, so the web UI and
+#: the API cannot drift apart on what a servable folder name looks like.
+FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,160}$")
+
 _HANDLE_RE = re.compile(r"[^A-Za-z0-9_]")
 _DIGITS_RE = re.compile(r"[^0-9]")
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)

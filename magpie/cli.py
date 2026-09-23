@@ -300,7 +300,7 @@ def cmd_posts(args: argparse.Namespace, settings: Settings) -> int:
 def cmd_query(args: argparse.Namespace, settings: Settings) -> int:
     ds = _dataset(settings)
     try:
-        rows = ds.query(args.sql)
+        rows, _truncated = ds.query(args.sql)
     except ValueError as exc:
         print(f"rejected: {exc}", file=sys.stderr)
         ds.close()

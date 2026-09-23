@@ -67,8 +67,9 @@ class Settings:
     site_name: str = field(default_factory=lambda: _s("MAGPIE_SITE_NAME", "Magpie"))
 
     # --- auth ---
-    # auth_token gates every mutating route (capture, meta, delete).
-    # public_read=False additionally gates reads.
+    # auth_token gates every mutating route (capture, meta, delete) and the
+    # whole /api/v1 surface, which refuses to serve at all without one.
+    # public_read=False additionally gates the HTML reads.
     auth_token: str | None = field(default_factory=lambda: _s("MAGPIE_AUTH_TOKEN"))
     public_read: bool = field(default_factory=lambda: _b("MAGPIE_PUBLIC_READ", True))
     trust_proxy: bool = field(default_factory=lambda: _b("MAGPIE_TRUST_PROXY", False))
@@ -141,6 +142,21 @@ class Settings:
     tsa_url: str = field(default_factory=lambda: _s("MAGPIE_TSA_URL", "https://freetsa.org/tsr"))
     tsa_timeout: float = field(default_factory=lambda: _f("MAGPIE_TSA_TIMEOUT", 20.0))
     operator: str | None = field(default_factory=lambda: _s("MAGPIE_OPERATOR"))
+
+    # --- HTTP API ---
+    # Job concurrency is 2, not `concurrency`: API-triggered collection shares
+    # X's rate limits with the monitor daemon, and a stampede gets both
+    # throttled. Jobs live in the web process only; a restart forgets them,
+    # which is correct - the data they produce is already in sqlite.
+    api_job_concurrency: int = field(default_factory=lambda: _i("MAGPIE_API_JOB_CONCURRENCY", 2))
+    api_job_ttl: float = field(default_factory=lambda: _f("MAGPIE_API_JOB_TTL", 3600.0))
+    api_job_max: int = field(default_factory=lambda: _i("MAGPIE_API_JOB_MAX", 200))
+    api_docs: bool = field(default_factory=lambda: _b("MAGPIE_API_DOCS", True))
+    # /api/v1/query runs caller SQL. `query_only` stops writes but not work: a
+    # recursive CTE runs forever and a self-join materialises arbitrarily many
+    # rows, so the statement needs a deadline and the result set needs a cap.
+    api_query_timeout: float = field(default_factory=lambda: _f("MAGPIE_API_QUERY_TIMEOUT", 5.0))
+    api_query_rows: int = field(default_factory=lambda: _i("MAGPIE_API_QUERY_ROWS", 5000))
 
     def __post_init__(self) -> None:
         # Absolute: package paths become file:// URIs for the renderer, and a

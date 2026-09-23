@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -156,10 +157,28 @@ def test_query_is_read_only(ds: Dataset) -> None:
     with pytest.raises(ValueError):
         ds.query("  -- comment\n PRAGMA user_version")
 
-    rows = ds.query("SELECT id, screen_name FROM posts WHERE screen_name = ?", ("alpha",))
-    assert rows == [{"id": "1", "screen_name": "alpha"}]
-    assert ds.query("SELECT COUNT(*) AS n FROM posts;")[0]["n"] == 1
+    rows, truncated = ds.query(
+        "SELECT id, screen_name FROM posts WHERE screen_name = ?", ("alpha",)
+    )
+    assert rows == [{"id": "1", "screen_name": "alpha"}] and truncated is False
+    assert ds.query("SELECT COUNT(*) AS n FROM posts;")[0][0]["n"] == 1
     assert ds.stats()["posts"] == 1
+
+
+def test_query_bounds_runaway_work(ds: Dataset) -> None:
+    """query_only stops writes, not work: a recursive CTE otherwise never ends."""
+    for n in range(5):
+        ds.upsert_post(make_post(str(n), "alpha"))
+
+    rows, truncated = ds.query("SELECT id FROM posts", max_rows=2)
+    assert len(rows) == 2 and truncated is True
+
+    with pytest.raises(sqlite3.OperationalError):
+        ds.query(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) "
+            "SELECT count(*) FROM c",
+            timeout=0.5,
+        )
 
 
 def test_cursor_roundtrip_for_unseen_handle(ds: Dataset) -> None:
