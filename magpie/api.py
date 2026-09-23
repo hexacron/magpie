@@ -16,34 +16,46 @@ contract and are easier to keep exact this way.
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .capture import capture_many
 from .config import Settings
-from .dataset import Dataset
-from .jobs import Job, JobCapacityError, JobRegistry
+from .dataset import CSV_HEADER, Dataset, handle_key
+from .jobs import JOB_KINDS, STATUSES, Job, JobCapacityError, JobRegistry
 from .models import TOOL_VERSION
 from .pull import PullReport, expand_thread, pull
-from .store import Store
+from .search import SEARCH_PRODUCTS
+from .store import FOLDER_RE, Store
 from .watchlist import Watchlist
 
 log = logging.getLogger("magpie.api")
 
 __all__ = ["build_api_router"]
 
-#: A capture folder is always ``<stamp>_<handle>_<id>``; nothing else is served.
-FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,160}$")
-
-SEARCH_PRODUCTS = ("Latest", "Top", "Media", "People")
-
-#: Hard ceiling on one search job regardless of what the caller asks for.
+#: Hard ceilings on one job regardless of what the caller asks for. The
+#: configured `thread_depth`/`thread_max_posts` are defaults, not limits, and a
+#: crawl budget is an outbound request count against X from this server's IP.
 SEARCH_LIMIT_MAX = 1000
+THREAD_DEPTH_MAX = 10
+THREAD_POSTS_MAX = 2000
+
+#: X screen names. Anything else would be polled forever by the monitor daemon.
+HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+
+#: Swagger UI assets. Pinned to an exact build, not FastAPI's floating `@5`:
+#: the docs page is same-origin with the API and the browser attaches the
+#: session cookie, so a mutable third-party script is a live credential.
+SWAGGER_CDN = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14"
 
 _MISSING = object()
 
@@ -88,6 +100,9 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 
 def _as_float(value: Any) -> float | None:
+    """A positive float, or None for anything that is not one."""
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -121,7 +136,15 @@ def build_api_router(
 ) -> APIRouter:
     """The whole ``/api/v1`` surface. `write` is create_app's auth dependency."""
 
-    router = APIRouter(prefix=f"{settings.base_path}/api/v1", dependencies=write, tags=["api"])
+    async def _api_disabled() -> None:
+        # Without a token `require_write` is a no-op, which would leave SQL,
+        # dataset export and the job runner open to anyone who reaches the
+        # port. The HTML UI keeps its open-by-default behaviour; the API does
+        # not get to inherit it.
+        raise HTTPException(503, "API disabled: set MAGPIE_AUTH_TOKEN")
+
+    gate = list(write) if settings.auth_token else [Depends(_api_disabled)]
+    router = APIRouter(prefix=f"{settings.base_path}/api/v1", dependencies=gate, tags=["api"])
 
     def _submit(
         kind: str, params: dict[str, Any], run: Callable[[Job], Awaitable[dict[str, Any]]]
@@ -192,7 +215,10 @@ def build_api_router(
     async def run_query(request: Request) -> Response:
         """Read-only SQL over the dataset: `{"sql": "SELECT ...", "params": [...]}`.
 
-        One SELECT/WITH statement, executed on a `query_only` connection.
+        One SELECT/WITH statement on a `query_only` connection, with a deadline
+        (`MAGPIE_API_QUERY_TIMEOUT`) and a row cap (`MAGPIE_API_QUERY_ROWS`):
+        read-only does not mean cheap, and this runs off the event loop so a
+        slow query stalls one worker thread rather than the whole server.
         """
         payload = await _body(request)
         if payload is None:
@@ -204,26 +230,55 @@ def build_api_router(
         if raw_params is not None and not isinstance(raw_params, list):
             return _err("'params' must be a list", 400)
         try:
-            rows = dataset.query(sql, tuple(raw_params or ()))
+            rows, truncated = await run_in_threadpool(
+                dataset.query,
+                sql,
+                tuple(raw_params or ()),
+                timeout=settings.api_query_timeout,
+                max_rows=settings.api_query_rows,
+            )
         except ValueError as exc:
             return _err(str(exc), 400)
         except Exception as exc:
-            return _err(f"query failed: {type(exc).__name__}: {exc}", 400)
-        return JSONResponse({"rows": rows, "count": len(rows)})
+            # The class is actionable; the message carries database paths and
+            # proxy hosts, so it goes to the log instead of the response.
+            log.warning("query failed: %s: %s", type(exc).__name__, exc)
+            return _err(f"query failed: {type(exc).__name__}", 400)
+        return JSONResponse({"rows": rows, "count": len(rows), "truncated": truncated})
 
     @router.get("/export/{fmt}")
     async def export(fmt: str, handle: str | None = None) -> Response:
-        """Whole dataset as `jsonl` or `csv`, optionally for one `handle`."""
+        """Whole dataset as `jsonl` or `csv`, optionally for one `handle`.
+
+        Streamed row by row: the dataset grows without bound, so buffering the
+        whole export would make each request a memory multiplier.
+        """
         if fmt == "jsonl":
-            body = dataset.export_jsonl(None, handle)
+            def rows() -> Any:
+                for row in dataset.iter_export(handle):
+                    yield json.dumps(row, ensure_ascii=False) + "\n"
+
             media_type = "application/x-ndjson"
         elif fmt == "csv":
-            body = dataset.export_csv(None, handle)
+            def rows() -> Any:
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow(CSV_HEADER)
+                for row in dataset.iter_export(handle):
+                    writer.writerow(
+                        ["" if row.get(c) is None else row.get(c) for c in CSV_HEADER]
+                    )
+                    yield buf.getvalue()
+                    buf.seek(0)
+                    buf.truncate(0)
+                if buf.tell():  # header only: no posts matched
+                    yield buf.getvalue()
+
             media_type = "text/csv; charset=utf-8"
         else:
             return _err("unknown export format; expected jsonl or csv", 404)
-        return Response(
-            body,
+        return StreamingResponse(
+            rows(),
             media_type=media_type,
             headers={
                 "Content-Disposition": f'attachment; filename="magpie-posts-{_stamp()}.{fmt}"'
@@ -255,28 +310,48 @@ def build_api_router(
         handles = _str_list(payload.get("handles")) or _str_list(payload.get("handle"))
         if not handles:
             return _err("expected {'handles': [...]}", 400)
-        interval = payload.get("interval")
+        if len(handles) > settings.max_batch:
+            return _err(f"at most {settings.max_batch} handles per request", 400)
+        # Validate the whole batch first: a 400 halfway through the loop would
+        # leave a partially mutated watchlist the caller cannot see.
+        for handle in handles:
+            if not HANDLE_RE.match(handle_key(handle)):
+                return _err(f"not a screen name: {handle!r}", 400)
+
+        interval = payload.get("interval", _MISSING)
+        seconds: float | None = None
+        if interval is not _MISSING and interval is not None:
+            seconds = _as_float(interval)
+            if seconds is None:
+                return _err("'interval' must be a positive number of seconds", 400)
+        enabled = payload.get("enabled", _MISSING)
+        if enabled is not _MISSING and not isinstance(enabled, bool):
+            return _err("'enabled' must be true or false", 400)
+
         tags = payload.get("tags")
         note = payload.get("note")
-        enabled = _as_bool(payload.get("enabled"), True)
-        added = []
-        for handle in handles:
-            try:
-                entry = watchlist.add(
+        added = [
+            _watch_row(
+                watchlist.add(
                     handle,
-                    interval=None if interval is None else _as_float(interval),
+                    interval=seconds,
                     tags=_str_list(tags) if tags is not None else None,
                     note=None if note is None else str(note),
-                    enabled=enabled,
+                    enabled=True if enabled is _MISSING else bool(enabled),
                 )
-            except ValueError as exc:
-                return _err(str(exc), 400)
-            added.append(_watch_row(entry))
+            )
+            for handle in handles
+        ]
         return JSONResponse({"added": added}, 201)
 
     @router.patch("/watchlist/{handle}")
     async def patch_watchlist(handle: str, request: Request) -> Response:
-        """Change one account's `interval` (null clears the override) or `enabled` flag."""
+        """Change one account's `interval` (null clears the override) or `enabled` flag.
+
+        Both are validated rather than coerced: `{"interval": "soon"}` silently
+        clearing the override, or `{"enabled": 0}` enabling the account, would
+        be the opposite of what the caller asked for, reported as success.
+        """
         payload = await _body(request)
         if payload is None:
             return _err("expected a JSON object", 400)
@@ -284,11 +359,18 @@ def build_api_router(
             return _err("not watched", 404)
 
         interval = payload.get("interval", _MISSING)
+        if interval is not _MISSING and interval is not None:
+            seconds = _as_float(interval)
+            if seconds is None:
+                return _err("'interval' must be a positive number of seconds or null", 400)
+        enabled = payload.get("enabled", _MISSING)
+        if enabled is not _MISSING and not isinstance(enabled, bool):
+            return _err("'enabled' must be true or false", 400)
+
         if interval is not _MISSING:
             watchlist.set_interval(handle, None if interval is None else _as_float(interval))
-        enabled = payload.get("enabled", _MISSING)
         if enabled is not _MISSING:
-            watchlist.enable(handle, _as_bool(enabled, True))
+            watchlist.enable(handle, enabled)
 
         entry = watchlist.get(handle)
         if entry is None:  # pragma: no cover - it existed a statement ago
@@ -346,7 +428,9 @@ def build_api_router(
         payload = await _body(request)
         if payload is None:
             return _err("expected {'targets': [...]}", 400)
-        targets = _str_list(payload.get("targets"))
+        # `pull()` re-splits every element on whitespace, so counting list
+        # items would let one string carry an unbounded crawl past max_batch.
+        targets = [tok for item in _str_list(payload.get("targets")) for tok in item.split()]
         if not targets:
             return _err("expected {'targets': [...]}", 400)
         if len(targets) > settings.max_batch:
@@ -412,7 +496,7 @@ def build_api_router(
             from .search import search
 
             session, _account_store = _session_for(settings)
-            if not getattr(session, "available", True):
+            if not hasattr(session, "available") or not session.available:
                 # A guest token cannot reach SearchTimeline; degrading to one
                 # silently would return an empty result set that looks like
                 # "no matches".
@@ -452,8 +536,14 @@ def build_api_router(
         tweet_id = str(payload.get("tweet_id") or "").strip()
         if not tweet_id:
             return _err("expected {'tweet_id': '...'}", 400)
+        # A crawl budget is an outbound request count against X from this
+        # server's IP, so the caller gets a ceiling, not just a default.
         depth = _as_int(payload.get("depth"))
+        if depth is not None and not 0 <= depth <= THREAD_DEPTH_MAX:
+            return _err(f"'depth' must be between 0 and {THREAD_DEPTH_MAX}", 400)
         max_posts = _as_int(payload.get("max_posts"))
+        if max_posts is not None and not 1 <= max_posts <= THREAD_POSTS_MAX:
+            return _err(f"'max_posts' must be between 1 and {THREAD_POSTS_MAX}", 400)
 
         async def run(job: Job) -> dict[str, Any]:
             report = await expand_thread(
@@ -491,8 +581,8 @@ def build_api_router(
 
     @router.get("/jobs")
     async def list_jobs(
-        status: str | None = None,
-        kind: str | None = None,
+        status: str | None = Query(None, pattern=f"^({'|'.join(STATUSES)})$"),
+        kind: str | None = Query(None, pattern=f"^({'|'.join(JOB_KINDS)})$"),
         limit: int = Query(50, ge=1, le=500),
     ) -> Response:
         """Submitted jobs, newest first. Lives in this process only."""
@@ -592,10 +682,17 @@ def build_api_router(
 
     @router.get("/captures/{folder}/verify")
     async def verify_capture(folder: str) -> Response:
-        """Re-hash a package and compare it against its manifest."""
+        """Re-hash a package and compare it against its manifest.
+
+        A package that is not there is a 404, not an `ok: false` verdict: the
+        two mean different things and a client acting on integrity must be able
+        to tell them apart.
+        """
         if not FOLDER_RE.match(folder or ""):
             return _err("unknown capture", 404)
         try:
+            if not store.package_path(folder).is_dir():
+                return _err("unknown capture", 404)
             result = store.verify(folder)
         except ValueError:
             return _err("unknown capture", 404)
@@ -607,16 +704,22 @@ def build_api_router(
         from fastapi.openapi.docs import get_swagger_ui_html
         from fastapi.openapi.utils import get_openapi
 
+        # The document only changes when the process does, and generating it
+        # walks every route in the app - not something to redo per Swagger load.
+        cached: dict[str, Any] = {}
+
         @router.get("/openapi.json", include_in_schema=False)
         async def openapi(request: Request) -> Response:
             """This app's OpenAPI document. Token-gated like everything else."""
-            return JSONResponse(
-                get_openapi(
-                    title=settings.site_name,
-                    version=TOOL_VERSION,
-                    routes=request.app.routes,
+            if not cached:
+                cached.update(
+                    get_openapi(
+                        title=settings.site_name,
+                        version=TOOL_VERSION,
+                        routes=request.app.routes,
+                    )
                 )
-            )
+            return JSONResponse(cached)
 
         @router.get("/docs", include_in_schema=False)
         async def docs() -> Response:
@@ -624,11 +727,17 @@ def build_api_router(
 
             The page loads Swagger's JS/CSS from a CDN, so the docs (not the
             API) need internet access. In a browser it authenticates with the
-            same `xw_token` cookie the HTML UI sets at /login.
+            same `xw_token` cookie the HTML UI sets at /login - which is also
+            why the asset URLs pin an exact build rather than FastAPI's
+            floating `@5` range: a script here runs same-origin with that
+            cookie, so a mutable third-party artifact would be a live key to
+            the whole API.
             """
             return get_swagger_ui_html(
                 openapi_url=f"{settings.base_path}/api/v1/openapi.json",
                 title=f"{settings.site_name} API",
+                swagger_js_url=f"{SWAGGER_CDN}/swagger-ui-bundle.js",
+                swagger_css_url=f"{SWAGGER_CDN}/swagger-ui.css",
             )
 
     return router

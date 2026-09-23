@@ -132,7 +132,8 @@ would crash-loop under `restart: unless-stopped`, and a crash-looping container 
 
 `magpie serve` exposes a JSON API at `/api/v1` that does what the CLI does: read the dataset,
 drive collection, edit the watchlist, check the monitor. Every route — reads included —
-requires `MAGPIE_AUTH_TOKEN`:
+requires `MAGPIE_AUTH_TOKEN`, and **without one the API refuses to serve at all** (`503`)
+rather than inheriting the HTML UI's open-by-default behaviour:
 
 ```sh
 curl -H "Authorization: Bearer $MAGPIE_AUTH_TOKEN" 127.0.0.1:8099/api/v1/stats
@@ -317,6 +318,8 @@ Every setting is an environment variable. See `.env.example`.
 | `MAGPIE_API_JOB_TTL` | `3600.0` | Seconds a finished job stays readable |
 | `MAGPIE_API_JOB_MAX` | `200` | Hard cap on retained jobs |
 | `MAGPIE_API_DOCS` | `1` | Serve Swagger UI at `/api/v1/docs` |
+| `MAGPIE_API_QUERY_TIMEOUT` | `5.0` | Deadline for one `/api/v1/query` statement, seconds |
+| `MAGPIE_API_QUERY_ROWS` | `5000` | Row cap for `/api/v1/query`; responses report `truncated` |
 
 ## The evidence model
 
@@ -377,6 +380,13 @@ The TSA's CA certificate is not bundled; fetch it from the authority named in
 reach the instance can trigger captures, edit tags and notes, and delete packages. Do not
 expose an instance to a network you do not control without setting it. Set
 `MAGPIE_PUBLIC_READ=0` as well if captures should not be readable anonymously.
+
+`/api/v1` is the exception: it is a strictly larger surface — SQL over the dataset, whole-
+dataset export, watchlist edits and server-side collection jobs — so with no token it
+answers `503` instead of serving. A token holder can still spend the server's resources by
+design; `MAGPIE_API_QUERY_TIMEOUT`, `MAGPIE_API_QUERY_ROWS`, `MAGPIE_MAX_BATCH` and
+`MAGPIE_API_JOB_CONCURRENCY` are what bound that, and `/api/v1/docs` loads Swagger from a
+pinned jsDelivr build (set `MAGPIE_API_DOCS=0` to serve no third-party script at all).
 
 The container binds `0.0.0.0` inside its namespace; the published port is what determines
 exposure. Bind it to `127.0.0.1` and put a TLS-terminating reverse proxy in front — see the

@@ -34,6 +34,9 @@ STATUSES = ("queued", "running", "completed", "failed", "cancelled")
 #: Finished, in any sense. These are the ones retention may drop.
 _TERMINAL = ("completed", "failed", "cancelled")
 
+#: Seconds to wait for a cancelled task to actually stop before reporting back.
+_CANCEL_GRACE = 5.0
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -187,7 +190,15 @@ class JobRegistry:
         return jobs[: max(0, int(limit))]
 
     async def cancel(self, job_id: str) -> bool:
-        """True only when a live job was actually stopped."""
+        """True only when a live job was actually stopped.
+
+        Cancellation lands at the job's next suspension point, and a job body
+        has long synchronous stretches (storing a page of posts, rendering a
+        PDF). The wait is therefore bounded: the request returns with the
+        status as it stands rather than being held by the job it just killed.
+        `await task` is deliberately not used - it would also swallow a
+        `CancelledError` aimed at this handler when the client disconnects.
+        """
         job = self.get(job_id)
         if job is None or job.done:
             return False
@@ -195,12 +206,7 @@ class JobRegistry:
         if task is None or task.done():
             return False
         task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-        if not job.done:  # pragma: no cover - _run always settles
-            self._settle(job, "cancelled")
+        await asyncio.wait({task}, timeout=_CANCEL_GRACE)
         return job.status == "cancelled"
 
     async def shutdown(self) -> None:
@@ -208,9 +214,6 @@ class JobRegistry:
         tasks = [t for t in self._tasks.values() if not t.done()]
         for task in tasks:
             task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if tasks:
+            await asyncio.wait(tasks, timeout=_CANCEL_GRACE)
         self._tasks.clear()

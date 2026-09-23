@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -682,8 +683,22 @@ class Dataset:
             ).fetchall()
         return [_row_dict(r) for r in rows]
 
-    def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
-        """Read-only escape hatch: one SELECT/WITH statement, nothing else."""
+    def query(
+        self,
+        sql: str,
+        params: tuple = (),
+        *,
+        timeout: float | None = None,
+        max_rows: int | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read-only escape hatch: one SELECT/WITH statement, nothing else.
+
+        Returns ``(rows, truncated)``. ``query_only`` stops writes but not work:
+        ``WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c)`` never
+        terminates and a self-join materialises arbitrarily many rows. `timeout`
+        aborts the statement from sqlite's progress handler; `max_rows` stops
+        reading rather than letting the result set define the memory ceiling.
+        """
         text = _strip_sql_lead(sql or "")
         if not text:
             raise ValueError("empty query")
@@ -693,14 +708,29 @@ class Dataset:
             raise ValueError("only a single statement is allowed")
         conn = self._reader()
         try:
-            rows = conn.execute(text, tuple(params)).fetchall()
+            if timeout and timeout > 0:
+                deadline = time.monotonic() + float(timeout)
+                # Returning true from the handler aborts the statement; 10k VM
+                # steps is often enough to catch a runaway loop, rare enough not
+                # to cost a normal query anything measurable.
+                conn.set_progress_handler(lambda: time.monotonic() > deadline, 10_000)
+            cursor = conn.execute(text, tuple(params))
+            if max_rows is not None and max_rows >= 0:
+                rows = cursor.fetchmany(max_rows + 1)
+                truncated = len(rows) > max_rows
+                rows = rows[:max_rows]
+            else:
+                rows = cursor.fetchall()
+                truncated = False
         finally:
+            conn.set_progress_handler(None, 0)
             conn.close()
-        return [{k: r[k] for k in r.keys()} for r in rows]
+        return [{k: r[k] for k in r.keys()} for r in rows], truncated
 
     # ---------------------------------------------------------- export
 
-    def _iter_export(self, handle: str | None) -> Iterator[dict[str, Any]]:
+    def iter_export(self, handle: str | None = None) -> Iterator[dict[str, Any]]:
+        """Stream export rows, one post at a time, so nothing buffers them all."""
         clause, params = self._post_filters(handle, None, None, None, None)
         columns = ", ".join(LIST_COLUMNS)
         conn = self._reader()
@@ -733,7 +763,7 @@ class Dataset:
 
     def export_jsonl(self, path: str | None = None, handle: str | None = None) -> str:
         def emit(out: IO[str]) -> None:
-            for row in self._iter_export(handle):
+            for row in self.iter_export(handle):
                 out.write(json.dumps(row, ensure_ascii=False))
                 out.write("\n")
 
@@ -743,7 +773,7 @@ class Dataset:
         def emit(out: IO[str]) -> None:
             writer = csv.writer(out)
             writer.writerow(CSV_HEADER)
-            for row in self._iter_export(handle):
+            for row in self.iter_export(handle):
                 writer.writerow(["" if row.get(c) is None else row.get(c) for c in CSV_HEADER])
 
         return self._write_export(path, emit)

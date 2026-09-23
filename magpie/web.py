@@ -42,7 +42,7 @@ from .config import Settings, load_settings
 from .dataset import Dataset
 from .jobs import JobRegistry
 from .models import TOOL_VERSION
-from .store import Store
+from .store import FOLDER_RE, Store
 from .watchlist import Watchlist
 
 log = logging.getLogger("magpie.web")
@@ -55,8 +55,6 @@ PER_PAGE = 24
 RECENT_ON_INDEX = 8
 COOKIE_NAME = "xw_token"
 
-#: A capture folder is always ``<stamp>_<handle>_<id>``; nothing else is served.
-FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,160}$")
 
 #: The record is untrusted third-party HTML. It may show its own pictures and
 #: its own inline CSS, and it may do nothing else - no fonts, no scripts, no
@@ -264,7 +262,8 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     if not settings.auth_token:
         log.warning(
             "MAGPIE_AUTH_TOKEN is not set: capture, tag and delete routes are open to "
-            "anyone who can reach this server. Set MAGPIE_AUTH_TOKEN before exposing it."
+            "anyone who can reach this server, and /api/v1 refuses to serve at all. "
+            "Set MAGPIE_AUTH_TOKEN before exposing it."
         )
     elif not settings.public_read:
         log.info("Private instance: reads require the token as well.")
@@ -296,7 +295,12 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
         if not expected:
             return True
         supplied = await _supplied_token(request)
-        return bool(supplied) and secrets.compare_digest(supplied, expected)
+        # compare_digest rejects non-ASCII str outright; starlette decodes
+        # headers as latin-1, so a stray accented byte would be a 500 rather
+        # than a clean 401. Bytes compare unconditionally.
+        return bool(supplied) and secrets.compare_digest(
+            supplied.encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+        )
 
     def _exempt(path: str) -> bool:
         return (

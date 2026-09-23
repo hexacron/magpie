@@ -11,6 +11,7 @@ a task created in the test's loop cannot be awaited from that one.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -124,7 +125,7 @@ async def test_query_rejects_writes(app: FastAPI, ds: Dataset) -> None:
 
     assert denied.status_code == 400
     assert "SELECT" in denied.json()["detail"]
-    assert allowed.json() == {"rows": [{"id": "1"}], "count": 1}
+    assert allowed.json() == {"rows": [{"id": "1"}], "count": 1, "truncated": False}
     # The rejection was a rejection, not a silent success.
     assert ds.post("1") is not None
 
@@ -143,6 +144,28 @@ async def test_export_formats(app: FastAPI, ds: Dataset) -> None:
     assert jsonl.text.strip().count("\n") == 0 and '"id": "1"' in jsonl.text
     assert csv_out.status_code == 200 and "alpha" in csv_out.text
     assert bogus.status_code == 404
+
+
+async def test_query_caps_the_result_set(settings: Settings, ds: Dataset) -> None:
+    """Read-only does not mean cheap: a self-join must not define the memory ceiling."""
+    settings.api_query_rows = 2
+    for n in range(5):
+        ds.upsert_post(make_post(str(n)))
+
+    async with client_for(create_app(settings)) as api:
+        body = (await api.post("/api/v1/query", json={"sql": "SELECT id FROM posts"})).json()
+
+    assert len(body["rows"]) == 2
+    assert body["count"] == 2 and body["truncated"] is True
+
+
+async def test_query_error_text_stays_in_the_log(app: FastAPI) -> None:
+    """sqlite messages carry database paths; the caller gets the class only."""
+    async with client_for(app) as api:
+        broken = await api.post("/api/v1/query", json={"sql": "SELECT nope FROM posts"})
+
+    assert broken.status_code == 400
+    assert broken.json()["detail"] == "query failed: OperationalError"
 
 
 # -------------------------------------------------------------- watchlist
@@ -179,6 +202,54 @@ async def test_watchlist_add_rejects_empty_handles(app: FastAPI) -> None:
     async with client_for(app) as api:
         assert (await api.post("/api/v1/watchlist", json={"handles": []})).status_code == 400
         assert (await api.post("/api/v1/watchlist", json={})).status_code == 400
+
+
+async def test_watchlist_rejects_junk_input(app: FastAPI) -> None:
+    """Coercion here would report success while doing the opposite of the request."""
+    async with client_for(app) as api:
+        await api.post("/api/v1/watchlist", json={"handles": ["@alpha"], "interval": 120})
+
+        # An unparseable interval must not read as "clear the override".
+        bad = await api.patch("/api/v1/watchlist/alpha", json={"interval": "soon"})
+        assert bad.status_code == 400
+        assert (await api.get("/api/v1/watchlist")).json()["rows"][0]["interval"] == 120.0
+
+        # `0` is the numeric false shells and jq emit; it must not enable.
+        assert (await api.patch("/api/v1/watchlist/alpha", json={"enabled": 0})).status_code == 400
+        assert (await api.get("/api/v1/watchlist")).json()["rows"][0]["enabled"] is True
+
+        # Explicit null still clears it.
+        cleared = await api.patch("/api/v1/watchlist/alpha", json={"interval": None})
+        assert cleared.json()["interval"] is None
+
+        # Anything non-empty used to become a watched account the monitor polls forever.
+        assert (await api.post("/api/v1/watchlist", json={"handles": ["../../etc"]})).status_code == 400
+        assert (await api.post("/api/v1/watchlist", json={"handles": ["@a"] * 99})).status_code == 400
+
+
+async def test_tune_never_slows_an_account_that_lost_posts(
+    settings: Settings, ds: Dataset
+) -> None:
+    """A rollover is measured evidence of loss; the suggestion is a sparse estimate."""
+    now = datetime.now(timezone.utc)
+    for n in range(8):
+        stamp = (now - timedelta(minutes=30 * n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ds.upsert_post(make_post(str(n), created=stamp))
+
+    watchlist = Watchlist(settings)
+    watchlist.add("@alpha", interval=60.0)
+    watchlist.record_poll("alpha", rollover=True, default_interval=settings.watch_interval)
+    watchlist.close()
+
+    async with client_for(create_app(settings)) as api:
+        tuned = (await api.post("/api/v1/watchlist/alpha/tune")).json()
+        rows = (await api.get("/api/v1/watchlist")).json()["rows"]
+
+    # suggest_interval measures ~30-minute gaps and would slow this to the
+    # 300s ceiling; the rollover clamp keeps the faster learned cadence.
+    assert tuned["interval"] <= 60.0
+    assert "rollover" in tuned["reason"]
+    assert rows[0]["effective_interval"] == tuned["interval"]
 
 
 async def test_tune_needs_history(app: FastAPI) -> None:
@@ -359,6 +430,33 @@ async def test_pull_job_validates_its_targets(job_app: FastAPI, settings: Settin
         )
     assert too_many.status_code == 400
     assert str(settings.max_batch) in too_many.json()["detail"]
+    # `pull()` re-splits on whitespace, so the cap has to count tokens: one
+    # string used to smuggle an unbounded crawl past max_batch.
+    async with client_for(job_app) as api:
+        smuggled = await api.post(
+            "/api/v1/jobs/pull",
+            json={"targets": [" ".join(f"@a{n}" for n in range(settings.max_batch + 1))]},
+        )
+    assert smuggled.status_code == 400
+
+
+async def test_thread_job_bounds_the_crawl(job_app: FastAPI) -> None:
+    """depth/max_posts are outbound request counts against X, not preferences."""
+    async with client_for(job_app) as api:
+        deep = await api.post("/api/v1/jobs/thread", json={"tweet_id": "1", "depth": 100000})
+        wide = await api.post(
+            "/api/v1/jobs/thread", json={"tweet_id": "1", "max_posts": 100000}
+        )
+        assert (await api.post("/api/v1/jobs/thread", json={})).status_code == 400
+    assert deep.status_code == 400 and wide.status_code == 400
+
+
+async def test_jobs_filters_reject_unknown_values(job_app: FastAPI) -> None:
+    """A typo must not read as 'no such jobs'."""
+    async with client_for(job_app) as api:
+        assert (await api.get("/api/v1/jobs", params={"kind": "pul"})).status_code == 422
+        assert (await api.get("/api/v1/jobs", params={"status": "runnin"})).status_code == 422
+        assert (await api.get("/api/v1/jobs", params={"kind": "pull"})).status_code == 200
 
 
 async def test_search_job_rejects_unknown_product(job_app: FastAPI) -> None:
@@ -387,3 +485,36 @@ async def test_docs_can_be_switched_off(settings: Settings) -> None:
     settings.api_docs = False
     async with client_for(create_app(settings)) as api:
         assert (await api.get("/api/v1/docs")).status_code == 404
+
+
+# --------------------------------------------------------------- captures
+
+
+async def test_capture_routes_reject_unservable_folders(app: FastAPI) -> None:
+    async with client_for(app) as api:
+        listed = await api.get("/api/v1/captures")
+        missing = await api.get("/api/v1/captures/20260101T000000Z_a_1")
+        traversal = await api.get("/api/v1/captures/..%2F..%2Fetc")
+        verify = await api.get("/api/v1/captures/20260101T000000Z_a_1/verify")
+
+    assert listed.json() == {"total": 0, "limit": 50, "offset": 0, "rows": []}
+    assert missing.status_code == 404 and missing.json() == {"detail": "unknown capture"}
+    assert traversal.status_code == 404
+    assert verify.status_code == 404
+
+
+# ------------------------------------------------------------------- auth
+
+
+async def test_api_refuses_to_serve_without_a_token(tmp_path: Path) -> None:
+    """`require_write` is a no-op with no token; the API must not inherit that."""
+    open_app = create_app(Settings(data_dir=tmp_path, auth_token=None))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=open_app), base_url="http://api"
+    ) as api:
+        refused = await api.get("/api/v1/posts")
+        assert refused.status_code == 503
+        assert "MAGPIE_AUTH_TOKEN" in refused.json()["detail"]
+        assert (await api.post("/api/v1/query", json={"sql": "SELECT 1"})).status_code == 503
+        # The HTML UI keeps its open-by-default behaviour.
+        assert (await api.get("/healthz")).status_code == 200
