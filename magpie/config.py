@@ -142,6 +142,16 @@ class Settings:
     tsa_timeout: float = field(default_factory=lambda: _f("MAGPIE_TSA_TIMEOUT", 20.0))
     operator: str | None = field(default_factory=lambda: _s("MAGPIE_OPERATOR"))
 
+    # --- HTTP API ---
+    # Job concurrency is 2, not `concurrency`: API-triggered collection shares
+    # X's rate limits with the monitor daemon, and a stampede gets both
+    # throttled. Jobs live in the web process only; a restart forgets them,
+    # which is correct - the data they produce is already in sqlite.
+    api_job_concurrency: int = field(default_factory=lambda: _i("MAGPIE_API_JOB_CONCURRENCY", 2))
+    api_job_ttl: float = field(default_factory=lambda: _f("MAGPIE_API_JOB_TTL", 3600.0))
+    api_job_max: int = field(default_factory=lambda: _i("MAGPIE_API_JOB_MAX", 200))
+    api_docs: bool = field(default_factory=lambda: _b("MAGPIE_API_DOCS", True))
+
     def __post_init__(self) -> None:
         # Absolute: package paths become file:// URIs for the renderer, and a
         # relative path cannot be expressed as one.

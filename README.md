@@ -128,6 +128,60 @@ Seed a fresh deployment without an exec step by setting `MAGPIE_WATCH="@Reuters 
 would crash-loop under `restart: unless-stopped`, and a crash-looping container cannot be
 `exec`d into to fix itself.
 
+## API
+
+`magpie serve` exposes a JSON API at `/api/v1` that does what the CLI does: read the dataset,
+drive collection, edit the watchlist, check the monitor. Every route — reads included —
+requires `MAGPIE_AUTH_TOKEN`:
+
+```sh
+curl -H "Authorization: Bearer $MAGPIE_AUTH_TOKEN" 127.0.0.1:8099/api/v1/stats
+```
+
+`X-Auth-Token` and the `xw_token` cookie the web UI sets at `/login` are accepted too, which
+is what makes the self-hosted Swagger UI at `/api/v1/docs` usable from a logged-in browser.
+(`MAGPIE_PUBLIC_READ` only ever relaxes the HTML routes. It does not open the API.)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/posts` | Filter by `q`, `user`, `since`, `until`, `media`, `limit`, `offset` |
+| `GET` | `/posts/{id}` | One post with its media rows |
+| `GET` | `/users` | Profiles seen while collecting |
+| `GET` | `/stats` | Dataset, capture-store and watchlist counters |
+| `POST` | `/query` | `{"sql": "SELECT ...", "params": [...]}` — one read-only statement |
+| `GET` | `/export/{jsonl,csv}` | Whole dataset, optionally `?handle=` |
+| `GET` | `/watchlist` | Watched accounts and their effective cadence |
+| `POST` | `/watchlist` | `{"handles": ["@a"], "interval": 300, "tags": [...]}` |
+| `PATCH` | `/watchlist/{handle}` | Set `interval` (null clears) or `enabled` |
+| `DELETE` | `/watchlist/{handle}` | Stop watching |
+| `POST` | `/watchlist/{handle}/tune` | Cadence from that account's measured posting rate |
+| `POST` | `/jobs/pull` | `{"targets": ["@handle", "<url or id>"]}` |
+| `POST` | `/jobs/search` | `{"query": "..."}` or `text`/`from`/`since`/… — needs an account |
+| `POST` | `/jobs/thread` | `{"tweet_id": "...", "depth": 2}` |
+| `POST` | `/jobs/capture` | `{"links": [...]}` — builds evidence packages |
+| `GET` | `/jobs` | Submitted jobs, newest first; filter by `status`/`kind` |
+| `GET` | `/jobs/{id}` | Status, progress and `result` |
+| `DELETE` | `/jobs/{id}` | Cancel a queued or running job |
+| `GET` | `/monitor` | Per-account poll liveness — `magpie health` as data |
+| `GET` | `/captures`, `/captures/{folder}`, `/captures/{folder}/verify` | Evidence packages |
+
+Collection is slow — a pull walks a timeline, a capture renders a PDF — so those four
+endpoints return `202` with a job id and the caller polls instead of holding a request open:
+
+```sh
+JOB=$(curl -sS -X POST -H "Authorization: Bearer $MAGPIE_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"targets":["@Reuters"]}' \
+  127.0.0.1:8099/api/v1/jobs/pull | jq -r .job.id)
+
+curl -sS -H "Authorization: Bearer $MAGPIE_AUTH_TOKEN" \
+  127.0.0.1:8099/api/v1/jobs/$JOB | jq '{status, new: .result.new_posts}'
+# {"status": "completed", "new": 5}
+```
+
+Jobs live in the web process only: a restart forgets them. What they produce is already in
+sqlite, so nothing is lost but the receipt. `MAGPIE_API_JOB_CONCURRENCY` defaults to 2 so
+API-triggered collection does not stampede X alongside the monitor daemon.
+
 ## Evidence mode (optional)
 
 `magpie capture` and the web UI produce the sealed package described below — raw source
@@ -259,6 +313,10 @@ Every setting is an environment variable. See `.env.example`.
 | `MAGPIE_TSA_URL` | `https://freetsa.org/tsr` | Timestamp authority endpoint |
 | `MAGPIE_TSA_TIMEOUT` | `20.0` | TSA request timeout, seconds |
 | `MAGPIE_OPERATOR` | *(unset)* | Operator recorded in each manifest |
+| `MAGPIE_API_JOB_CONCURRENCY` | `2` | API collection jobs running at once; the rest queue |
+| `MAGPIE_API_JOB_TTL` | `3600.0` | Seconds a finished job stays readable |
+| `MAGPIE_API_JOB_MAX` | `200` | Hard cap on retained jobs |
+| `MAGPIE_API_DOCS` | `1` | Serve Swagger UI at `/api/v1/docs` |
 
 ## The evidence model
 

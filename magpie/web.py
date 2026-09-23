@@ -6,13 +6,14 @@ a three-line clipboard helper for the manifest hash.
 Two auth gates (defects 8 and 9 of the original):
 
 * ``require_write`` - when ``settings.auth_token`` is set, every mutating route
-  and every ``/api/*`` route needs the token.
+  and every ``/api/v1`` route needs the token.
 * ``require_read``  - when ``settings.public_read`` is False, the same check is
   extended to every route except ``/healthz``, ``/static`` and ``/login``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -35,9 +36,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
 
+from .api import build_api_router
 from .capture import capture_many, load_timestamp
 from .config import Settings, load_settings
 from .dataset import Dataset
+from .jobs import JobRegistry
 from .models import TOOL_VERSION
 from .store import Store
 from .watchlist import Watchlist
@@ -236,6 +239,7 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     # optional evidence path. Both are served from one UI.
     dataset = Dataset(settings)
     watchlist = Watchlist(settings)
+    jobs = JobRegistry(settings)
     base = settings.base_path
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -316,12 +320,20 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
         if not getattr(request.state, "authed", False) and not await _is_authed(request):
             raise _AuthRequired("write")
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Jobs are in-process: a shutdown that leaves them running holds the
+        # loop open and loses their state anyway. Cancel and wait.
+        yield
+        await jobs.shutdown()
+
     app = FastAPI(
         title=settings.site_name,
         version=TOOL_VERSION,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     app.mount(f"{base}/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -716,53 +728,6 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
         except _NotFound:
             return _not_found(request, f"No file {path!r} in {folder!r}.")
 
-    # ------------------------------------------------------------------- API
-
-    @router.post("/api/capture", dependencies=write)
-    async def api_capture(request: Request) -> Response:
-        try:
-            payload = await request.json()
-        except Exception:
-            return JSONResponse({"detail": "body must be JSON"}, 400)
-        links = payload.get("links") if isinstance(payload, dict) else payload
-        if isinstance(links, str):
-            links = [links]
-        if not isinstance(links, list) or not links:
-            return JSONResponse({"detail": "expected {'links': [...]}"}, 400)
-        try:
-            manifests = await capture_many(
-                [str(item) for item in links], settings, store, operator=settings.operator
-            )
-        except Exception as exc:
-            log.exception("api capture failed")
-            return JSONResponse({"detail": f"capture failed: {exc}"}, 500)
-        return JSONResponse([m.to_dict() for m in manifests])
-
-    @router.get("/api/captures", dependencies=write)
-    async def api_captures(
-        q: str | None = None,
-        user: str | None = None,
-        date: str | None = None,
-        tag: str | None = None,
-        status: str | None = None,
-        limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
-    ) -> Response:
-        rows, total = store.search(
-            q=q, user=user, date=date, tag=tag, status=status, limit=limit, offset=offset
-        )
-        return JSONResponse({"total": total, "rows": [r.to_dict() for r in rows]})
-
-    @router.get("/api/capture/{folder}", dependencies=write)
-    async def api_capture_detail(folder: str) -> Response:
-        try:
-            manifest = store.get_manifest(folder) if FOLDER_RE.match(folder or "") else None
-        except ValueError:
-            manifest = None
-        if manifest is None:
-            return JSONResponse({"detail": "unknown capture"}, 404)
-        return JSONResponse(manifest)
-
     @router.get("/export/json")
     async def export_json() -> Response:
         body = json.dumps(store.export_rows(), indent=2, ensure_ascii=False)
@@ -847,6 +812,16 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
         return response
 
     app.include_router(router)
+    app.include_router(
+        build_api_router(
+            settings=settings,
+            store=store,
+            dataset=dataset,
+            watchlist=watchlist,
+            jobs=jobs,
+            write=write,
+        )
+    )
 
     @app.exception_handler(_AuthRequired)
     async def _auth_handler(request: Request, exc: _AuthRequired) -> Response:
